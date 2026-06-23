@@ -1,16 +1,19 @@
 {
   "tag_size_m": 0.166,
+  "field_width_m": 5.0,
+  "field_height_m": 4.0,
   "fov_degrees": 66.1,
   "min_tag_width_pixels": 8,
   "filter_alpha": 0.3,
-  "output_filter_alpha": 0.15,
+  "output_filter_alpha": 0.08,
+  "debug_logging": false,
   "unity_ip": "192.168.43.226",
   "unity_port": 9005,
   "tag_world_positions": {
-    "1": {"x": 5.0, "y": 0.0, "z": 0.0},
-    "2": {"x": 0.0, "y": 0.0, "z": 0.0},
-    "3": {"x": 0.0, "y": 0.0, "z": 4.0},
-    "4": {"x": 5.0, "y": 0.0, "z": 4.0}
+    "1": {"x": 5.0, "y": 0.0, "z": 4.0},
+    "2": {"x": 0.0, "y": 0.0, "z": 4.0},
+    "3": {"x": 0.0, "y": 0.0, "z": 0.0},
+    "4": {"x": 5.0, "y": 0.0, "z": 0.0}
   },
   "car_tag_id": 10,
   "flip_x": false,

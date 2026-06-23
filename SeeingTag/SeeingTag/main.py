@@ -44,6 +44,13 @@ def load_config(path: str) -> dict:
     return {
         "tag_size_m": cfg["tag_size_m"],
         "min_tag_width": cfg.get("min_tag_width_pixels", 10),
+        "field_width_m": cfg.get("field_width_m", 5.0),
+        "field_height_m": cfg.get("field_height_m", 4.0),
+        "filter_alpha": cfg.get("filter_alpha", 1.0),
+        "output_filter_alpha": cfg.get("output_filter_alpha", 1.0),
+        "flip_x": cfg.get("flip_x", False),
+        "flip_z": cfg.get("flip_z", False),
+        "debug_logging": cfg.get("debug_logging", False),
         "unity_ip": cfg["unity_ip"],
         "unity_port": cfg["unity_port"],
         "tag_positions": tag_positions,
@@ -61,13 +68,28 @@ def truncate_to_2_decimals(value: float) -> float:
     return int(value * 100) / 100.0
 
 
+def normalize_angle(angle: float) -> float:
+    """将角度约束到 [-180, 180) 范围。"""
+    return (angle + 180.0) % 360.0 - 180.0
+
+
+def smooth_angle(previous: float, current: float, alpha: float) -> float:
+    """沿最短旋转方向平滑 yaw，避免 179° 到 -179° 时绕一整圈。"""
+    delta = normalize_angle(current - previous)
+    return normalize_angle(previous + alpha * delta)
+
+
 class UdpSender:
-    def __init__(self, target_ip: str, target_port: int):
+    def __init__(self, target_ip: str, target_port: int, output_filter_alpha: float = 1.0,
+                 debug_logging: bool = False):
         self.target = (target_ip, target_port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.seq = 0
+        self.output_filter_alpha = float(np.clip(output_filter_alpha, 0.0, 1.0))
+        self.debug_logging = debug_logging
+        self.filtered_output: Optional[Tuple[float, float, float]] = None
 
-    def send(self, x: float, z: float, yaw: float = 0.0) -> bool:
+    def send(self, x: float, z: float, yaw: float = 0.0, tracking_state: str = "raw") -> bool:
         """
         通过UDP发送位置和偏航角数据
         参数:
@@ -78,6 +100,19 @@ class UdpSender:
             发送成功返回True，失败返回False
         """
         try:
+            # 单独平滑 Unity 输出；画面中的位置仍使用视觉追踪层的平滑结果。
+            if self.filtered_output is None:
+                self.filtered_output = (x, z, yaw)
+            else:
+                old_x, old_z, old_yaw = self.filtered_output
+                alpha = self.output_filter_alpha
+                self.filtered_output = (
+                    old_x + alpha * (x - old_x),
+                    old_z + alpha * (z - old_z),
+                    smooth_angle(old_yaw, yaw, alpha),
+                )
+            x, z, yaw = self.filtered_output
+
             # 截断到两位小数
             x_truncated = truncate_to_2_decimals(x)
             z_truncated = truncate_to_2_decimals(z)
@@ -87,12 +122,14 @@ class UdpSender:
                 "type": "robot_position",
                 "pos": [float(z_truncated), 0.10, float(x_truncated)],  # Unity坐标系：交换x和z的顺序
                 "euler": [0.0, float(yaw_truncated), 0.0],  # yaw角（绕Y轴旋转）
+                "tracking_state": tracking_state,
                 "seq": self.seq,
                 "timestamp": time.time()
             }
             self.seq += 1
             self.sock.sendto(json.dumps(data).encode('utf-8'), self.target)
-            print(f"[UDP] 发送成功 → {self.target[0]}:{self.target[1]}  pos=({z_truncated:.2f}, 0.0, {x_truncated:.2f})  yaw={yaw_truncated:.1f}°  seq={self.seq-1}")
+            if self.debug_logging:
+                print(f"[UDP] → {self.target[0]}:{self.target[1]} pos=({z_truncated:.2f}, 0.0, {x_truncated:.2f}) yaw={yaw_truncated:.1f}° seq={self.seq-1} state={tracking_state}")
             return True
         except Exception as e:
             print(f"[UDP] 发送失败: {e}")
@@ -108,6 +145,11 @@ class TagTracker:
         self.min_tag_width = cfg["min_tag_width"]
         self.tag_positions = cfg["tag_positions"]
         self.car_tag_id = cfg["car_tag_id"]
+        self.field_width = cfg["field_width_m"]
+        self.field_height = cfg["field_height_m"]
+        self.flip_x = cfg["flip_x"]
+        self.flip_z = cfg["flip_z"]
+        self.debug_logging = cfg["debug_logging"]
         
         # H 矩阵更新模式配置
         self.homography_update_mode = cfg.get("homography_update_mode", "interval")
@@ -126,26 +168,15 @@ class TagTracker:
         self.detector = aruco.ArucoDetector(self.dictionary, self.parameters)
 
         # UDP 发送器
-        self.udp: Optional[UdpSender] = UdpSender(cfg["unity_ip"], cfg["unity_port"])
+        self.udp: Optional[UdpSender] = UdpSender(
+            cfg["unity_ip"], cfg["unity_port"], cfg["output_filter_alpha"], self.debug_logging
+        )
 
         # 单应矩阵缓存
         self.H: Optional[np.ndarray] = None
         self.homography_valid = False
         # 标记 H 矩阵是否已初始化（用于 "once" 模式）
         self.homography_initialized = False
-
-    @staticmethod
-    def build_tag_corners_world(tag_center: np.ndarray, tag_size: float) -> np.ndarray:
-        """返回标签4个角点在世界 XZ 平面上的坐标 (x, z)"""
-        s2 = tag_size / 2
-        local = np.array([
-            [-s2, -s2, 0],
-            [ s2, -s2, 0],
-            [ s2,  s2, 0],
-            [-s2,  s2, 0],
-        ])
-        corners_3d = tag_center + local
-        return corners_3d[:, [0, 2]]  # 只保留 (x, z)
 
     def detect(self, gray: np.ndarray) -> List[dict]:
         """
@@ -187,10 +218,12 @@ class TagTracker:
                     return {"id": int(tag_id), "corners": c.copy(), "width_px": w}
         return None
 
-    def compute_homography(self, detections: List[dict]) -> bool:
+    def compute_homography(self, detections: List[dict], keep_existing: bool = False) -> bool:
         """
-        用固定标签的角点计算单应矩阵
-        需要至少 4 个点（可以是 1 个完整标签或多个标签的组合）
+        用固定标签的中心点计算单应矩阵。
+
+        每个固定标签只贡献一对「图像中心 → 场地中心」对应点，因此标签
+        可以按识别效果任意旋转；为计算 H 必须同时看见至少 4 个固定标签。
         """
         src_pts = []  # 像素坐标 (u, v)
         dst_pts = []  # 世界坐标 (x, z)
@@ -198,19 +231,15 @@ class TagTracker:
         for d in detections:
             if d["id"] not in self.tag_positions:
                 continue
-            # 获取该标签的世界坐标角点
-            world_corners_xz = self.build_tag_corners_world(
-                self.tag_positions[d["id"]], self.tag_size
-            )
-            # 添加 4 个角点对应关系
-            for j in range(4):
-                src_pts.append(d["corners"][j].astype(np.float64))
-                dst_pts.append(world_corners_xz[j])
+            src_pts.append(np.mean(d["corners"], axis=0).astype(np.float64))
+            tag_center = self.tag_positions[d["id"]]
+            dst_pts.append([tag_center[0], tag_center[2]])
 
         # 至少需要 4 个点才能计算单应矩阵
         if len(src_pts) < 4:
-            self.homography_valid = False
-            self.H = None
+            if not keep_existing:
+                self.homography_valid = False
+                self.H = None
             return False
 
         src_pts = np.array(src_pts, dtype=np.float64)
@@ -223,11 +252,13 @@ class TagTracker:
             self.H = H
             self.homography_valid = True
             inlier_count = int(np.sum(mask))
-            print(f"[Homography] 计算成功: {len(src_pts)}个点, {inlier_count}个内点")
+            if self.debug_logging:
+                print(f"[Homography] 计算成功: {len(src_pts)}个点, {inlier_count}个内点")
             return True
         else:
-            self.homography_valid = False
-            self.H = None
+            if not keep_existing:
+                self.homography_valid = False
+                self.H = None
             return False
 
     def compute_yaw_from_corners(self, corners: np.ndarray) -> Optional[float]:
@@ -349,7 +380,83 @@ class TagTracker:
 
         return float(wx), float(wz), yaw
 
-    def send_position(self, x: float, z: float, yaw: float = 0.0):
+    def warp_to_bird_eye(self, frame: np.ndarray, output_width: int = 800,
+                         output_height: int = 640) -> Optional[Tuple[np.ndarray, dict]]:
+        """将原始画面映射到场地鸟瞰图，并返回坐标换算参数。"""
+        if not self.homography_valid or self.H is None:
+            return None
+
+        # 场地为 5m × 4m，四周留出 0.5m，便于观察边缘的车标签。
+        margin = 0.5
+        world_min_x, world_max_x = -margin, self.field_width + margin
+        world_min_z, world_max_z = -margin, self.field_height + margin
+        scale_x = output_width / (world_max_x - world_min_x)
+        scale_z = output_height / (world_max_z - world_min_z)
+
+        world_corners = np.array([
+            [world_min_x, world_min_z, 1],
+            [world_max_x, world_min_z, 1],
+            [world_max_x, world_max_z, 1],
+            [world_min_x, world_max_z, 1]
+        ], dtype=np.float64)
+
+        H_inv = np.linalg.inv(self.H)
+        src_pts = []
+        for corner in world_corners:
+            pixel = H_inv @ corner
+            pixel = pixel / pixel[2]
+            src_pts.append([pixel[0], pixel[1]])
+        src_pts = np.array(src_pts, dtype=np.float32)
+        dst_pts = np.array([
+            [0, 0], [output_width, 0],
+            [output_width, output_height], [0, output_height]
+        ], dtype=np.float32)
+
+        transform = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        bird_eye = cv2.warpPerspective(
+            frame, transform, (output_width, output_height), flags=cv2.INTER_CUBIC
+        )
+        return bird_eye, {
+            "world_min_x": world_min_x,
+            "world_min_z": world_min_z,
+            "scale_x": scale_x,
+            "scale_z": scale_z,
+        }
+
+    def locate_car_in_bird_eye(self, bird_eye: np.ndarray, transform_info: dict) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """在已拉正的鸟瞰图中检测车标签，作为原图检测失败时的兜底。"""
+        gray = cv2.cvtColor(bird_eye, cv2.COLOR_BGR2GRAY)
+        car_det = self.detect_car_only(gray)
+        if car_det is None:
+            return None, None, None
+
+        # 鸟瞰图的像素坐标可直接线性换算为场地 X/Z 坐标。
+        center = np.mean(car_det["corners"], axis=0)
+        world_x = transform_info["world_min_x"] + center[0] / transform_info["scale_x"]
+        world_z = transform_info["world_min_z"] + center[1] / transform_info["scale_z"]
+
+        # 同样将角点方向换算到世界坐标后计算偏航角。
+        p0, p1 = car_det["corners"][0], car_det["corners"][1]
+        direction_x = (p1[0] - p0[0]) / transform_info["scale_x"]
+        direction_z = (p1[1] - p0[1]) / transform_info["scale_z"]
+        yaw = float(np.degrees(np.arctan2(direction_z, direction_x)))
+        return float(world_x), float(world_z), yaw
+
+    def transform_output_coordinates(self, x: float, z: float,
+                                     yaw: Optional[float]) -> Tuple[float, float, Optional[float]]:
+        """按配置镜像场地坐标，并同步修正车辆朝向。"""
+        if self.flip_x:
+            x = self.field_width - x
+            if yaw is not None:
+                yaw = 180.0 - yaw
+        if self.flip_z:
+            z = self.field_height - z
+            if yaw is not None:
+                yaw = -yaw
+        return x, z, normalize_angle(yaw) if yaw is not None else None
+
+    def send_position(self, x: float, z: float, yaw: float = 0.0,
+                      tracking_state: str = "raw"):
         """
         发送位置和偏航角数据
         参数:
@@ -358,7 +465,7 @@ class TagTracker:
             yaw: 偏航角（度）
         """
         if self.udp is not None:
-            self.udp.send(x, z, yaw)
+            self.udp.send(x, z, yaw, tracking_state)
 
     def draw_hud(self, frame: np.ndarray, detections: List[dict],
                  car_x: Optional[float], car_z: Optional[float], 
@@ -436,60 +543,26 @@ class TagTracker:
         if not self.homography_valid or self.H is None:
             return None
 
-        h, w = frame.shape[:2]
-
-        # 定义世界坐标系中的目标区域（根据场地大小）
-        margin = 0.5  # 边距 0.5m
-        world_min_x = -margin
-        world_max_x = 5.0 + margin
-        world_min_z = -margin
-        world_max_z = 4.0 + margin
-
-        # 计算缩放比例：让世界坐标适配到输出图像
         output_width = 800
         output_height = 640
-        scale_x = output_width / (world_max_x - world_min_x)
-        scale_z = output_height / (world_max_z - world_min_z)
-
-        # 世界坐标的四个角点（齐次坐标）
-        world_corners = np.array([
-            [world_min_x, world_min_z, 1],
-            [world_max_x, world_min_z, 1],
-            [world_max_x, world_max_z, 1],
-            [world_min_x, world_max_z, 1]
-        ], dtype=np.float64)
-
-        # H: 像素 → 世界，所以 H_inv: 世界 → 像素
-        H_inv = np.linalg.inv(self.H)
-
-        # 将世界坐标角点转换到像素坐标
-        src_pts = []
-        for corner in world_corners:
-            pixel = H_inv @ corner
-            pixel = pixel / pixel[2]  # 归一化
-            src_pts.append([pixel[0], pixel[1]])
-        src_pts = np.array(src_pts, dtype=np.float32)
-
-        # 目标图像的四个角点（像素坐标）
-        dst_pts = np.array([
-            [0, 0],
-            [output_width, 0],
-            [output_width, output_height],
-            [0, output_height]
-        ], dtype=np.float32)
-
-        # 计算透视变换矩阵
-        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
-
-        # 执行透视变换
-        bird_eye = cv2.warpPerspective(frame, M, (output_width, output_height))
+        warped = self.warp_to_bird_eye(frame, output_width, output_height)
+        if warped is None:
+            return None
+        bird_eye, transform_info = warped
+        if self.flip_x or self.flip_z:
+            flip_code = -1 if self.flip_x and self.flip_z else (1 if self.flip_x else 0)
+            bird_eye = cv2.flip(bird_eye, flip_code)
+        world_min_x = transform_info["world_min_x"]
+        world_min_z = transform_info["world_min_z"]
+        scale_x = transform_info["scale_x"]
+        scale_z = transform_info["scale_z"]
 
         # 绘制场地边界（红色矩形）
         boundary_color = (0, 0, 255)
         top_left = (int((0 - world_min_x) * scale_x), int((0 - world_min_z) * scale_z))
-        top_right = (int((5.0 - world_min_x) * scale_x), int((0 - world_min_z) * scale_z))
-        bottom_right = (int((5.0 - world_min_x) * scale_x), int((4.0 - world_min_z) * scale_z))
-        bottom_left = (int((0 - world_min_x) * scale_x), int((4.0 - world_min_z) * scale_z))
+        top_right = (int((self.field_width - world_min_x) * scale_x), int((0 - world_min_z) * scale_z))
+        bottom_right = (int((self.field_width - world_min_x) * scale_x), int((self.field_height - world_min_z) * scale_z))
+        bottom_left = (int((0 - world_min_x) * scale_x), int((self.field_height - world_min_z) * scale_z))
         
         cv2.line(bird_eye, top_left, top_right, boundary_color, 2)
         cv2.line(bird_eye, top_right, bottom_right, boundary_color, 2)
@@ -498,8 +571,9 @@ class TagTracker:
 
         # 绘制固定标签位置（绿色圆圈）
         for tag_id, pos in self.tag_positions.items():
-            bx = int((pos[0] - world_min_x) * scale_x)
-            bz = int((pos[2] - world_min_z) * scale_z)
+            marker_x, marker_z, _ = self.transform_output_coordinates(float(pos[0]), float(pos[2]), None)
+            bx = int((marker_x - world_min_x) * scale_x)
+            bz = int((marker_z - world_min_z) * scale_z)
             cv2.circle(bird_eye, (bx, bz), 10, (0, 255, 0), -1)
             cv2.circle(bird_eye, (bx, bz), 12, (0, 200, 0), 2)
             cv2.putText(bird_eye, str(tag_id), (bx + 12, bz + 5),
@@ -531,9 +605,9 @@ class TagTracker:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         # 添加坐标轴说明
-        cv2.putText(bird_eye, f"X: 0-5m", (10, output_height - 40),
+        cv2.putText(bird_eye, f"X: 0-{self.field_width:g}m", (10, output_height - 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
-        cv2.putText(bird_eye, f"Z: 0-4m", (10, output_height - 20),
+        cv2.putText(bird_eye, f"Z: 0-{self.field_height:g}m", (10, output_height - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
 
         return bird_eye
@@ -703,7 +777,7 @@ def run_calibration(cfg: dict):
     cap = open_camera()
     print(f"[Homography] 固定标签: {list(cfg['tag_positions'].keys())}")
     print(f"[Homography] 车标签ID: {cfg['car_tag_id']}")
-    print(f"[Homography] 需要至少 4 个点（1个完整标签或多个标签组合）")
+    print(f"[Homography] 需要同时检测到 4 个固定标签（使用各标签中心点）")
 
     fps_time, fps_count, cur_fps = time.time(), 0, 0.0
 
@@ -811,6 +885,12 @@ def run_competition(cfg: dict):
 
     fps_time, fps_count, cur_fps = time.time(), 0, 0.0
     frame_no = 0
+    # 原图与鸟瞰图都短暂丢失时，保留最后一次可信位置，避免 Unity 中的车闪烁。
+    last_position: Optional[Tuple[float, float, float]] = None
+    last_detection_time = 0.0
+    position_hold_seconds = 0.35
+    visual_filtered_position: Optional[Tuple[float, float, float]] = None
+    visual_filter_alpha = float(np.clip(cfg["filter_alpha"], 0.0, 1.0))
 
     while True:
         ret, frame = cap.read()
@@ -822,9 +902,14 @@ def run_competition(cfg: dict):
         
         # 根据模式决定检测策略
         if h_mode == "every_frame":
-            # 模式1: 每帧都检测所有标签并更新 H 矩阵
+            # 每帧检测所有标签；只有出现固定标签时才更新 H，
+            # 防止固定标签暂时离开画面时把原本有效的 H 清空。
             detections = tracker.detect(gray)
-            car_x, car_z, car_yaw = tracker.locate(detections)
+            fixed_detections = [d for d in detections if d["id"] in tracker.tag_positions]
+            if fixed_detections:
+                tracker.compute_homography(detections, keep_existing=True)
+            car_det = next((d for d in detections if d["id"] == tracker.car_tag_id), None)
+            car_x, car_z, car_yaw = tracker.locate_with_cached_H(car_det)
         else:
             # 模式2/3: 检查是否需要更新 H 矩阵
             need_update_H = False
@@ -839,7 +924,7 @@ def run_competition(cfg: dict):
             if need_update_H:
                 # 需要更新 H 矩阵：检测所有标签
                 detections = tracker.detect(gray)
-                tracker.compute_homography(detections)
+                tracker.compute_homography(detections, keep_existing=True)
                 # 从检测结果中找车标签
                 car_det = next((d for d in detections if d["id"] == tracker.car_tag_id), None)
             else:
@@ -850,11 +935,51 @@ def run_competition(cfg: dict):
             # 使用缓存的 H 矩阵定位
             car_x, car_z, car_yaw = tracker.locate_with_cached_H(car_det)
 
+        tracking_source = "RAW"
+        position_detected = car_x is not None and car_z is not None
+
+        # 原图识别失败时，才生成高分辨率鸟瞰图进行第二次检测。
+        # 这样正常情况下没有额外开销，也避免把插值后的图像作为唯一依据。
+        if not position_detected:
+            fallback_warped = tracker.warp_to_bird_eye(frame, 1600, 1280)
+            if fallback_warped is not None:
+                fallback_bird_eye, transform_info = fallback_warped
+                car_x, car_z, car_yaw = tracker.locate_car_in_bird_eye(
+                    fallback_bird_eye, transform_info
+                )
+                position_detected = car_x is not None and car_z is not None
+                if position_detected:
+                    tracking_source = "BIRD-EYE FALLBACK"
+                    if tracker.debug_logging:
+                        print("[Tracking] 原图未识别到车标签，鸟瞰图兜底识别成功")
+
+        now = time.time()
+        if position_detected:
+            car_x, car_z, car_yaw = tracker.transform_output_coordinates(car_x, car_z, car_yaw)
+            if visual_filtered_position is None:
+                visual_filtered_position = (car_x, car_z, car_yaw if car_yaw is not None else 0.0)
+            else:
+                old_x, old_z, old_yaw = visual_filtered_position
+                visual_filtered_position = (
+                    old_x + visual_filter_alpha * (car_x - old_x),
+                    old_z + visual_filter_alpha * (car_z - old_z),
+                    smooth_angle(old_yaw, car_yaw if car_yaw is not None else old_yaw, visual_filter_alpha),
+                )
+            car_x, car_z, car_yaw = visual_filtered_position
+            last_position = (car_x, car_z, car_yaw if car_yaw is not None else 0.0)
+            last_detection_time = now
+        elif last_position is not None and now - last_detection_time <= position_hold_seconds:
+            car_x, car_z, car_yaw = last_position
+            tracking_source = "HOLD"
+        else:
+            tracking_source = "LOST"
+
         # 发送位置
         if car_x is not None and car_z is not None:
             yaw_to_send = car_yaw if car_yaw is not None else 0.0
-            tracker.send_position(car_x, car_z, yaw_to_send)
-            if frame_no % 30 == 0:
+            tracking_state = tracking_source.lower().replace("-", "_").replace(" ", "_")
+            tracker.send_position(car_x, car_z, yaw_to_send, tracking_state)
+            if tracker.debug_logging and frame_no % 30 == 0:
                 x_trunc = truncate_to_2_decimals(car_x)
                 z_trunc = truncate_to_2_decimals(car_z)
                 yaw_trunc = truncate_to_2_decimals(yaw_to_send)
@@ -874,6 +999,9 @@ def run_competition(cfg: dict):
             mode_text += f" (N={h_interval})"
         cv2.putText(display, mode_text, (10, display.shape[0] - 45),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(display, f"Track: {tracking_source}", (10, display.shape[0] - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (0, 255, 0) if tracking_source == "RAW" else (0, 255, 255), 1)
         
         # 生成鸟瞰图
         bird_eye = tracker.generate_bird_eye_view(frame, detections, car_x, car_z, car_yaw)
