@@ -11,6 +11,9 @@ import json
 import socket
 import time
 import sys
+import os
+import argparse
+import math
 from typing import Dict, List, Optional, Tuple
 
 
@@ -40,6 +43,11 @@ def load_config(path: str) -> dict:
     homography_interval = cfg.get("homography_update_interval", 30)
     if homography_interval < 1:
         homography_interval = 30
+
+    car_heading_offset = cfg.get("car_heading_offset_degrees", 0.0)
+    if not isinstance(car_heading_offset, (int, float)) or not math.isfinite(car_heading_offset):
+        print("[WARN] 无效的 car_heading_offset_degrees，使用 0°")
+        car_heading_offset = 0.0
     
     return {
         "tag_size_m": cfg["tag_size_m"],
@@ -55,9 +63,26 @@ def load_config(path: str) -> dict:
         "unity_port": cfg["unity_port"],
         "tag_positions": tag_positions,
         "car_tag_id": cfg["car_tag_id"],
+        "car_heading_offset_degrees": normalize_angle(float(car_heading_offset)),
         "homography_update_mode": homography_mode,
         "homography_update_interval": homography_interval,
+        "bird_eye_only": cfg.get("bird_eye_only", False),
     }
+
+
+def save_car_heading_offset(path: str, angle: float) -> float:
+    """将车头相对 Tag 的角度偏移写入配置文件，并返回规范化后的角度。"""
+    if not math.isfinite(angle):
+        raise ValueError("角度必须是有限数字")
+
+    normalized_angle = normalize_angle(angle)
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    cfg["car_heading_offset_degrees"] = normalized_angle
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return normalized_angle
 
 
 def truncate_to_2_decimals(value: float) -> float:
@@ -149,6 +174,8 @@ class TagTracker:
         self.field_height = cfg["field_height_m"]
         self.flip_x = cfg["flip_x"]
         self.flip_z = cfg["flip_z"]
+        # 用于把 Tag 的默认方向校正为真实车头；配置会同时影响 HUD、鸟瞰箭头和 UDP yaw。
+        self.car_heading_offset_degrees = cfg["car_heading_offset_degrees"]
         self.debug_logging = cfg["debug_logging"]
         
         # H 矩阵更新模式配置
@@ -453,7 +480,9 @@ class TagTracker:
             z = self.field_height - z
             if yaw is not None:
                 yaw = -yaw
-        return x, z, normalize_angle(yaw) if yaw is not None else None
+        if yaw is not None:
+            yaw = normalize_angle(yaw + self.car_heading_offset_degrees)
+        return x, z, yaw
 
     def send_position(self, x: float, z: float, yaw: float = 0.0,
                       tracking_state: str = "raw"):
@@ -831,7 +860,9 @@ def run_competition(cfg: dict):
     # 获取 H 矩阵更新模式
     h_mode = cfg.get("homography_update_mode", "interval")
     h_interval = cfg.get("homography_update_interval", 30)
+    bird_eye_only = cfg.get("bird_eye_only", False)
     print(f"  H矩阵更新模式: {h_mode}" + (f" (每{h_interval}帧)" if h_mode == "interval" else ""))
+    print(f"  鸟瞰图专用模式: {'ON' if bird_eye_only else 'OFF'}")
 
     tracker = TagTracker(cfg)
     cap = open_camera()
@@ -899,59 +930,78 @@ def run_competition(cfg: dict):
             continue
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # 根据模式决定检测策略
-        if h_mode == "every_frame":
-            # 每帧检测所有标签；只有出现固定标签时才更新 H，
-            # 防止固定标签暂时离开画面时把原本有效的 H 清空。
-            detections = tracker.detect(gray)
-            fixed_detections = [d for d in detections if d["id"] in tracker.tag_positions]
-            if fixed_detections:
-                tracker.compute_homography(detections, keep_existing=True)
-            car_det = next((d for d in detections if d["id"] == tracker.car_tag_id), None)
-            car_x, car_z, car_yaw = tracker.locate_with_cached_H(car_det)
-        else:
-            # 模式2/3: 检查是否需要更新 H 矩阵
-            need_update_H = False
-            
-            if h_mode == "once":
-                # 模式2: 只在启动时更新一次，之后不再更新
-                need_update_H = False
-            elif h_mode == "interval":
-                # 模式3: 每 N 帧更新一次
-                need_update_H = (frame_no % h_interval == 0)
-            
-            if need_update_H:
-                # 需要更新 H 矩阵：检测所有标签
+
+        # 根据检测模式决定策略
+        detections = []
+        if bird_eye_only:
+            # ---- 鸟瞰图专用模式 ----
+            # 仍需定期检测固定标签以更新 H 矩阵
+            if h_mode == "every_frame":
+                detections = tracker.detect(gray)
+                fixed_detections = [d for d in detections if d["id"] in tracker.tag_positions]
+                if fixed_detections:
+                    tracker.compute_homography(detections, keep_existing=True)
+            elif h_mode == "interval" and frame_no % h_interval == 0:
                 detections = tracker.detect(gray)
                 tracker.compute_homography(detections, keep_existing=True)
-                # 从检测结果中找车标签
-                car_det = next((d for d in detections if d["id"] == tracker.car_tag_id), None)
-            else:
-                # 不需要更新 H 矩阵：只检测车标签
-                car_det = tracker.detect_car_only(gray)
-                detections = [car_det] if car_det else []
-            
-            # 使用缓存的 H 矩阵定位
-            car_x, car_z, car_yaw = tracker.locate_with_cached_H(car_det)
 
-        tracking_source = "RAW"
-        position_detected = car_x is not None and car_z is not None
-
-        # 原图识别失败时，才生成高分辨率鸟瞰图进行第二次检测。
-        # 这样正常情况下没有额外开销，也避免把插值后的图像作为唯一依据。
-        if not position_detected:
-            fallback_warped = tracker.warp_to_bird_eye(frame, 1600, 1280)
-            if fallback_warped is not None:
-                fallback_bird_eye, transform_info = fallback_warped
+            # 跳过原图车检测，直接用鸟瞰图
+            car_x, car_z, car_yaw = None, None, None
+            bird_warped = tracker.warp_to_bird_eye(frame, 1600, 1280)
+            if bird_warped is not None:
+                bird_eye_img, transform_info = bird_warped
                 car_x, car_z, car_yaw = tracker.locate_car_in_bird_eye(
-                    fallback_bird_eye, transform_info
+                    bird_eye_img, transform_info
                 )
-                position_detected = car_x is not None and car_z is not None
-                if position_detected:
-                    tracking_source = "BIRD-EYE FALLBACK"
-                    if tracker.debug_logging:
-                        print("[Tracking] 原图未识别到车标签，鸟瞰图兜底识别成功")
+
+            tracking_source = "BIRD-EYE"
+            position_detected = car_x is not None and car_z is not None
+        else:
+            # ---- 默认模式：先原图识别，失败再鸟瞰图兜底 ----
+            if h_mode == "every_frame":
+                # 每帧检测所有标签；只有出现固定标签时才更新 H，
+                # 防止固定标签暂时离开画面时把原本有效的 H 清空。
+                detections = tracker.detect(gray)
+                fixed_detections = [d for d in detections if d["id"] in tracker.tag_positions]
+                if fixed_detections:
+                    tracker.compute_homography(detections, keep_existing=True)
+                car_det = next((d for d in detections if d["id"] == tracker.car_tag_id), None)
+                car_x, car_z, car_yaw = tracker.locate_with_cached_H(car_det)
+            else:
+                # 模式2/3: 检查是否需要更新 H 矩阵
+                need_update_H = False
+
+                if h_mode == "once":
+                    need_update_H = False
+                elif h_mode == "interval":
+                    need_update_H = (frame_no % h_interval == 0)
+
+                if need_update_H:
+                    detections = tracker.detect(gray)
+                    tracker.compute_homography(detections, keep_existing=True)
+                    car_det = next((d for d in detections if d["id"] == tracker.car_tag_id), None)
+                else:
+                    car_det = tracker.detect_car_only(gray)
+                    detections = [car_det] if car_det else []
+
+                car_x, car_z, car_yaw = tracker.locate_with_cached_H(car_det)
+
+            tracking_source = "RAW"
+            position_detected = car_x is not None and car_z is not None
+
+            # 原图识别失败时，才生成高分辨率鸟瞰图进行第二次检测。
+            if not position_detected:
+                fallback_warped = tracker.warp_to_bird_eye(frame, 1600, 1280)
+                if fallback_warped is not None:
+                    fallback_bird_eye, transform_info = fallback_warped
+                    car_x, car_z, car_yaw = tracker.locate_car_in_bird_eye(
+                        fallback_bird_eye, transform_info
+                    )
+                    position_detected = car_x is not None and car_z is not None
+                    if position_detected:
+                        tracking_source = "BIRD-EYE FALLBACK"
+                        if tracker.debug_logging:
+                            print("[Tracking] 原图未识别到车标签，鸟瞰图兜底识别成功")
 
         now = time.time()
         if position_detected:
@@ -1045,8 +1095,33 @@ def run_competition(cfg: dict):
 
 
 def main():
-    mode = "calibration" if len(sys.argv) > 1 and sys.argv[1] in ("--calibrate", "-c") else "competition"
-    cfg = load_config("tag_config.json")
+    parser = argparse.ArgumentParser(
+        description="SeeingTag ARUCO 智能车定位系统"
+    )
+    parser.add_argument("--calibrate", "-c", action="store_true", help="校准模式：不发送 UDP")
+    parser.add_argument(
+        "--set-car-heading", metavar="ANGLE", type=float,
+        help="设置车头相对 Tag 默认方向的角度偏移（度），并永久保存到配置文件"
+    )
+    parser.add_argument("--show-car-heading", action="store_true", help="显示当前永久保存的车头角度偏移后退出")
+    args = parser.parse_args()
+
+    config_path = os.path.join(os.path.dirname(__file__), "tag_config.json")
+    if args.set_car_heading is not None:
+        try:
+            angle = save_car_heading_offset(config_path, args.set_car_heading)
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            parser.error(f"无法保存车头角度：{e}")
+        print(f"[Config] 车头角度偏移已永久保存为 {angle:g}°")
+        return
+
+    cfg = load_config(config_path)
+    if args.show_car_heading:
+        print(f"[Config] 当前车头角度偏移：{cfg['car_heading_offset_degrees']:g}°")
+        return
+
+    mode = "calibration" if args.calibrate else "competition"
+    print(f"[Config] 车头角度偏移：{cfg['car_heading_offset_degrees']:g}°")
 
     if mode == "calibration":
         run_calibration(cfg)

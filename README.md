@@ -59,7 +59,30 @@ python main.py --calibrate
 | `filter_alpha` | 鸟瞰图和 HUD 的位置/朝向平滑系数 |
 | `output_filter_alpha` | UDP 输出平滑系数 |
 | `flip_x` / `flip_z` | 镜像坐标与朝向，用于校正 Unity 坐标方向 |
+| `car_heading_offset_degrees` | 车头相对车载 Tag 默认方向的角度偏移（度）；会影响鸟瞰箭头和 Unity yaw |
 | `debug_logging` | 输出高频调试日志，比赛时建议关闭 |
+
+## 调整车头方向
+
+车载 Tag 的默认方向由其印刷朝向决定；当 Tag 横放或以任意角度安装时，可以为真实车头设置一个固定偏移角。此偏移会同时作用于鸟瞰图箭头、HUD 和发送给 Unity 的 yaw，并永久写入 `tag_config.json`，下次启动自动生效。
+
+在项目目录执行（角度单位为度）：
+
+```powershell
+# 例如：让车头相对当前 Tag 默认方向逆时针旋转 90°
+python main.py --set-car-heading 90
+
+# 反方向旋转 90°
+python main.py --set-car-heading -90
+
+# 恢复为 Tag 默认方向
+python main.py --set-car-heading 0
+
+# 查看当前已保存的偏移值
+python main.py --show-car-heading
+```
+
+建议先以 `0°` 启动并观察鸟瞰箭头，再以 `±90°`、`180°` 逐步试验，直到箭头与真实车头一致。正值按系统世界坐标的 yaw 正方向叠加；角度会自动归一化到 `[-180°, 180°)`。
 
 ## 项目结构
 
