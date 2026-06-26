@@ -158,6 +158,35 @@ def predict_blind_position(history: Deque[Tuple[float, float, float, float]],
     )
 
 
+def draw_blind_status_overlay(image: np.ndarray, armed: bool, active: bool,
+                              message: str = "", message_visible: bool = False):
+    """在画面左上角显示盲开保护状态，方便试车时确认 1/0 是否生效。"""
+    if image is None:
+        return
+
+    if active:
+        status_text = "BLIND PROTECT: DRIVING"
+        status_color = (0, 165, 255)
+    elif armed:
+        status_text = "BLIND PROTECT: ARMED"
+        status_color = (0, 255, 255)
+    else:
+        status_text = "BLIND PROTECT: OFF"
+        status_color = (150, 150, 150)
+
+    cv2.rectangle(image, (8, 8), (390, 78), (0, 0, 0), -1)
+    cv2.rectangle(image, (8, 8), (390, 78), status_color, 2)
+    cv2.putText(image, status_text, (20, 36),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+    cv2.putText(image, "1=ONCE ARM   0=OFF", (20, 64),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
+
+    if message_visible and message:
+        cv2.rectangle(image, (8, 86), (520, 126), (0, 0, 0), -1)
+        cv2.putText(image, message, (20, 113),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, status_color, 2)
+
+
 class UdpSender:
     def __init__(self, target_ip: str, target_port: int, output_filter_alpha: float = 1.0,
                  debug_logging: bool = False):
@@ -982,6 +1011,8 @@ def run_competition(cfg: dict):
     blind_protection_armed = False
     blind_protection_active = False
     last_yaw_log_time = 0.0
+    blind_status_message = ""
+    blind_status_until = 0.0
     visual_filtered_position: Optional[Tuple[float, float, float]] = None
     visual_filter_alpha = float(np.clip(cfg["filter_alpha"], 0.0, 1.0))
 
@@ -1071,6 +1102,8 @@ def run_competition(cfg: dict):
                 print("[Blind] 车辆 Tag 已恢复识别，盲开保护自动关闭")
                 blind_protection_active = False
                 blind_protection_armed = False
+                blind_status_message = "Blind protect auto OFF: tag recovered"
+                blind_status_until = now + 2.0
             car_x, car_z, car_yaw = tracker.transform_output_coordinates(car_x, car_z, car_yaw)
             if visual_filtered_position is None:
                 visual_filtered_position = (car_x, car_z, car_yaw if car_yaw is not None else 0.0)
@@ -1092,6 +1125,8 @@ def run_competition(cfg: dict):
               and (blind_position := predict_blind_position(motion_history, now, blind_drive_seconds)) is not None):
             if not blind_protection_active:
                 print("[Blind] 车辆 Tag 识别丢失，开始按历史运动规律盲开")
+                blind_status_message = "Blind driving..."
+                blind_status_until = now + 2.0
                 blind_protection_active = True
             car_x, car_z, car_yaw = blind_position
             last_position = blind_position
@@ -1102,6 +1137,8 @@ def run_competition(cfg: dict):
                 print("[Blind] 盲开保护超时，切换为保持当前位置")
                 blind_protection_active = False
                 blind_protection_armed = False
+                blind_status_message = "Blind protect timeout: OFF"
+                blind_status_until = now + 2.0
             car_x, car_z, car_yaw = last_position
             tracking_source = "HOLD" if now - last_detection_time <= position_hold_seconds else "LOST HOLD"
         else:
@@ -1128,6 +1165,10 @@ def run_competition(cfg: dict):
             fps_time = time.time()
 
         display = tracker.draw_hud(frame, detections, car_x, car_z, car_yaw, cur_fps)
+        draw_blind_status_overlay(
+            display, blind_protection_armed, blind_protection_active,
+            blind_status_message, time.time() < blind_status_until
+        )
         
         # 添加模式显示
         mode_text = f"H-Mode: {h_mode}"
@@ -1145,6 +1186,11 @@ def run_competition(cfg: dict):
         
         # 生成鸟瞰图
         bird_eye = tracker.generate_bird_eye_view(frame, detections, car_x, car_z, car_yaw)
+        if bird_eye is not None:
+            draw_blind_status_overlay(
+                bird_eye, blind_protection_armed, blind_protection_active,
+                blind_status_message, time.time() < blind_status_until
+            )
 
         # 同时显示两个窗口
         cv2.imshow("SeeingTag - Original View", display)
@@ -1157,10 +1203,14 @@ def run_competition(cfg: dict):
         elif key == ord('1'):
             blind_protection_armed = True
             blind_protection_active = False
+            blind_status_message = "Blind protect ARMED"
+            blind_status_until = time.time() + 2.0
             print("[Blind] 已开启一次盲开保护：下一次车辆 Tag 丢失时开始外推")
         elif key == ord('0'):
             blind_protection_armed = False
             blind_protection_active = False
+            blind_status_message = "Blind protect OFF"
+            blind_status_until = time.time() + 2.0
             print("[Blind] 已关闭盲开保护")
         elif key == ord('r'):
             # 按 R 键重新校准 H 矩阵
