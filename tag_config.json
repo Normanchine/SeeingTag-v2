@@ -3,7 +3,7 @@
   "field_width_m": 5.0,
   "field_height_m": 4.0,
   "fov_degrees": 66.1,
-  "min_tag_width_pixels": 8,
+  "min_tag_width_pixels": 5,
   "filter_alpha": 0.3,
   "output_filter_alpha": 0.08,
   "debug_logging": false,
@@ -29,15 +29,28 @@
     "motion_history_seconds": "车标签识别正常时，保留最近多少秒的运动历史用于丢帧外推",
     "blind_drive_seconds": "车标签短暂丢失后，最多按历史速度和角速度盲开多少秒",
     "position_hold_seconds": "历史样本不足或盲开未开启时，保留上一可信位置多少秒后进入 LOST HOLD",
-    "yaw_log_interval_seconds": "控制台 yaw 输出间隔，单位秒"
+    "yaw_log_interval_seconds": "控制台 yaw 输出间隔，单位秒",
+    "blind_speed_window_seconds": "盲开前用最近多少秒的位置历史估计速度，短一些更跟手",
+    "blind_yaw_rate_window_seconds": "盲开前用最近多少秒的 yaw 历史估计转向速度",
+    "blind_yaw_rate_scale": "盲开时 yaw 角速度缩放，弯道出口建议小于 0.5",
+    "blind_max_yaw_rate_dps": "盲开 yaw 角速度上限，单位 度/秒",
+    "blind_yaw_rate_decay_per_second": "盲开持续时 yaw 角速度每秒衰减比例，越小越快趋向直线",
+    "blind_max_speed_mps": "盲开速度上限，单位 米/秒",
+    "blind_max_distance_m": "单次盲开最大距离，超过后自动关闭保护并保持当前位置"
   },
-  "motion_history_seconds": 0.8,
-  "blind_drive_seconds": 0.6,
-  "position_hold_seconds": 0.35,
+  "motion_history_seconds": 3.0,
+  "blind_drive_seconds": 2.0,
+  "position_hold_seconds": 0.5,
   "yaw_log_interval_seconds": 0.5,
+  "blind_speed_window_seconds": 0.5,
+  "blind_yaw_rate_window_seconds": 0.5,
+  "blind_yaw_rate_scale": 0.35,
+  "blind_max_yaw_rate_dps": 25.0,
+  "blind_yaw_rate_decay_per_second": 0.75,
+  "blind_max_speed_mps": 1.2,
+  "blind_max_distance_m": 0.45,
   "homography_update_mode": "once",
   "homography_update_interval": 30,
 
   "bird_eye_only": true
-  
 }

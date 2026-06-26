@@ -54,6 +54,13 @@ def load_config(path: str) -> dict:
     blind_drive_seconds = cfg.get("blind_drive_seconds", 1.2)
     position_hold_seconds = cfg.get("position_hold_seconds", 0.35)
     yaw_log_interval_seconds = cfg.get("yaw_log_interval_seconds", 0.5)
+    blind_speed_window_seconds = cfg.get("blind_speed_window_seconds", 0.5)
+    blind_yaw_rate_window_seconds = cfg.get("blind_yaw_rate_window_seconds", 0.5)
+    blind_yaw_rate_scale = cfg.get("blind_yaw_rate_scale", 0.35)
+    blind_max_yaw_rate_dps = cfg.get("blind_max_yaw_rate_dps", 25.0)
+    blind_yaw_rate_decay_per_second = cfg.get("blind_yaw_rate_decay_per_second", 0.75)
+    blind_max_speed_mps = cfg.get("blind_max_speed_mps", 1.2)
+    blind_max_distance_m = cfg.get("blind_max_distance_m", 0.45)
     if motion_history_seconds <= 0.1:
         motion_history_seconds = 4.0
     if blind_drive_seconds < 0.0:
@@ -62,6 +69,18 @@ def load_config(path: str) -> dict:
         position_hold_seconds = 0.0
     if yaw_log_interval_seconds <= 0.0:
         yaw_log_interval_seconds = 0.5
+    if blind_speed_window_seconds <= 0.05:
+        blind_speed_window_seconds = 0.5
+    if blind_yaw_rate_window_seconds <= 0.05:
+        blind_yaw_rate_window_seconds = 0.5
+    blind_yaw_rate_scale = float(np.clip(blind_yaw_rate_scale, 0.0, 1.0))
+    if blind_max_yaw_rate_dps < 0.0:
+        blind_max_yaw_rate_dps = 0.0
+    blind_yaw_rate_decay_per_second = float(np.clip(blind_yaw_rate_decay_per_second, 0.0, 1.0))
+    if blind_max_speed_mps <= 0.0:
+        blind_max_speed_mps = 1.2
+    if blind_max_distance_m <= 0.0:
+        blind_max_distance_m = 0.45
     
     return {
         "tag_size_m": cfg["tag_size_m"],
@@ -82,6 +101,13 @@ def load_config(path: str) -> dict:
         "blind_drive_seconds": float(blind_drive_seconds),
         "position_hold_seconds": float(position_hold_seconds),
         "yaw_log_interval_seconds": float(yaw_log_interval_seconds),
+        "blind_speed_window_seconds": float(blind_speed_window_seconds),
+        "blind_yaw_rate_window_seconds": float(blind_yaw_rate_window_seconds),
+        "blind_yaw_rate_scale": float(blind_yaw_rate_scale),
+        "blind_max_yaw_rate_dps": float(blind_max_yaw_rate_dps),
+        "blind_yaw_rate_decay_per_second": float(blind_yaw_rate_decay_per_second),
+        "blind_max_speed_mps": float(blind_max_speed_mps),
+        "blind_max_distance_m": float(blind_max_distance_m),
         "homography_update_mode": homography_mode,
         "homography_update_interval": homography_interval,
         "bird_eye_only": cfg.get("bird_eye_only", False),
@@ -132,30 +158,85 @@ def append_motion_sample(history: Deque[Tuple[float, float, float, float]],
 
 
 def predict_blind_position(history: Deque[Tuple[float, float, float, float]],
-                           timestamp: float, max_blind_seconds: float
+                           timestamp: float, max_blind_seconds: float,
+                           blind_elapsed_seconds: float,
+                           speed_window: float = 0.5,
+                           yaw_rate_window: float = 0.5,
+                           yaw_rate_scale: float = 0.35,
+                           max_yaw_rate_dps: float = 25.0,
+                           yaw_rate_decay_per_second: float = 0.75,
+                           max_speed_mps: float = 1.2
                            ) -> Optional[Tuple[float, float, float]]:
-    """按最近历史的平均平移速度和 yaw 角速度，短时预测车辆位置。"""
-    if len(history) < 2:
+    """受限 CTRV 模型：按近期弧线趋势外推，但限制转向和速度。
+
+    速度用短窗口平均，yaw 角速度会缩放、限幅，并随盲开时间衰减；
+    这样弯道出口丢失时会逐渐趋向直线，而不是一直按大圆弧拐。
+    """
+    if len(history) < 3:  # 至少 3 个点才能估计曲率
         return None
 
-    first_t, first_x, first_z, first_yaw = history[0]
-    last_t, last_x, last_z, last_yaw = history[-1]
-    lost_seconds = timestamp - last_t
-    if lost_seconds < 0.0 or lost_seconds > max_blind_seconds:
+    curr_t, curr_x, curr_z, curr_yaw = history[-1]
+    step_seconds = timestamp - curr_t
+    if step_seconds < 0.0 or blind_elapsed_seconds > max_blind_seconds:
         return None
 
-    history_seconds = last_t - first_t
-    if history_seconds < 0.08:
+    if step_seconds < 0.001:
         return None
 
-    vx = (last_x - first_x) / history_seconds
-    vz = (last_z - first_z) / history_seconds
-    yaw_rate = normalize_angle(last_yaw - first_yaw) / history_seconds
-    return (
-        last_x + vx * lost_seconds,
-        last_z + vz * lost_seconds,
-        normalize_angle(last_yaw + yaw_rate * lost_seconds),
-    )
+    # 1) 速度大小：最近 speed_window 秒的路径长度 / 时间，比只用最后两帧抗抖。
+    speed_cutoff_t = curr_t - speed_window
+    total_distance = 0.0
+    speed_total_dt = 0.0
+    for i in range(len(history) - 1, 0, -1):
+        t1, x1, z1, _ = history[i - 1]
+        t2, x2, z2, _ = history[i]
+        if t2 <= speed_cutoff_t:
+            break
+        dt = t2 - t1
+        if dt > 0.001:
+            total_distance += math.hypot(x2 - x1, z2 - z1)
+            speed_total_dt += dt
+    if speed_total_dt <= 0.001:
+        return None
+    speed = min(total_distance / speed_total_dt, max_speed_mps)
+
+    # 2) 角速度：最近 yaw_rate_window 秒平均，然后缩放、限幅、随时间衰减。
+    cutoff_t = curr_t - yaw_rate_window
+    total_dyaw = 0.0
+    yaw_total_dt = 0.0
+    for i in range(len(history) - 1, 0, -1):
+        t1, _, _, y1 = history[i - 1]
+        t2, _, _, y2 = history[i]
+        if t2 <= cutoff_t:
+            break
+        dt = t2 - t1
+        if dt > 0.001:
+            total_dyaw += normalize_angle(y2 - y1)
+            yaw_total_dt += dt
+    omega = total_dyaw / yaw_total_dt if yaw_total_dt > 0.001 else 0.0  # deg/s
+    omega *= yaw_rate_scale
+    omega = float(np.clip(omega, -max_yaw_rate_dps, max_yaw_rate_dps))
+    omega *= yaw_rate_decay_per_second ** max(0.0, blind_elapsed_seconds)
+
+    # 3) CTRV 沿圆弧外推
+    dyaw = omega * step_seconds
+    yaw_rad = math.radians(curr_yaw)
+    dyaw_rad = math.radians(dyaw)
+    omega_rad = math.radians(omega) if abs(omega) > 0.001 else 0.0
+
+    if abs(omega) < 0.5 or speed < 0.001:
+        # 近似直线
+        new_x = curr_x + speed * math.cos(yaw_rad) * step_seconds
+        new_z = curr_z + speed * math.sin(yaw_rad) * step_seconds
+        new_yaw = curr_yaw
+    else:
+        # 圆弧: R = v / ω
+        R = speed / omega_rad
+        new_x = curr_x + R * (math.sin(yaw_rad + dyaw_rad) - math.sin(yaw_rad))
+        new_z = curr_z + R * (math.cos(yaw_rad) - math.cos(yaw_rad + dyaw_rad))
+        new_yaw = normalize_angle(curr_yaw + dyaw)
+
+    return (new_x, new_z, new_yaw)
 
 
 def draw_blind_status_overlay(image: np.ndarray, armed: bool, active: bool,
@@ -1007,9 +1088,18 @@ def run_competition(cfg: dict):
     motion_history_seconds = cfg["motion_history_seconds"]
     blind_drive_seconds = cfg["blind_drive_seconds"]
     yaw_log_interval_seconds = cfg["yaw_log_interval_seconds"]
+    blind_speed_window_seconds = cfg["blind_speed_window_seconds"]
+    blind_yaw_rate_window_seconds = cfg["blind_yaw_rate_window_seconds"]
+    blind_yaw_rate_scale = cfg["blind_yaw_rate_scale"]
+    blind_max_yaw_rate_dps = cfg["blind_max_yaw_rate_dps"]
+    blind_yaw_rate_decay_per_second = cfg["blind_yaw_rate_decay_per_second"]
+    blind_max_speed_mps = cfg["blind_max_speed_mps"]
+    blind_max_distance_m = cfg["blind_max_distance_m"]
     motion_history: Deque[Tuple[float, float, float, float]] = deque()
     blind_protection_armed = False
     blind_protection_active = False
+    blind_started_at: Optional[float] = None
+    blind_start_position: Optional[Tuple[float, float]] = None
     last_yaw_log_time = 0.0
     blind_status_message = ""
     blind_status_until = 0.0
@@ -1102,6 +1192,8 @@ def run_competition(cfg: dict):
                 print("[Blind] 车辆 Tag 已恢复识别，盲开保护自动关闭")
                 blind_protection_active = False
                 blind_protection_armed = False
+                blind_started_at = None
+                blind_start_position = None
                 blind_status_message = "Blind protect auto OFF: tag recovered"
                 blind_status_until = now + 2.0
             car_x, car_z, car_yaw = tracker.transform_output_coordinates(car_x, car_z, car_yaw)
@@ -1121,22 +1213,60 @@ def run_competition(cfg: dict):
                 motion_history, now, last_position[0], last_position[1],
                 last_position[2], motion_history_seconds
             )
-        elif (blind_protection_armed
-              and (blind_position := predict_blind_position(motion_history, now, blind_drive_seconds)) is not None):
+        elif blind_protection_armed:
             if not blind_protection_active:
                 print("[Blind] 车辆 Tag 识别丢失，开始按历史运动规律盲开")
                 blind_status_message = "Blind driving..."
                 blind_status_until = now + 2.0
                 blind_protection_active = True
-            car_x, car_z, car_yaw = blind_position
-            last_position = blind_position
-            visual_filtered_position = blind_position
-            tracking_source = "BLIND"
+                blind_started_at = now
+                if last_position is not None:
+                    blind_start_position = (last_position[0], last_position[1])
+
+            blind_elapsed = now - blind_started_at if blind_started_at is not None else 0.0
+            blind_position = predict_blind_position(
+                motion_history, now, blind_drive_seconds, blind_elapsed,
+                blind_speed_window_seconds, blind_yaw_rate_window_seconds,
+                blind_yaw_rate_scale, blind_max_yaw_rate_dps,
+                blind_yaw_rate_decay_per_second, blind_max_speed_mps
+            )
+            blind_distance = 0.0
+            if blind_position is not None and blind_start_position is not None:
+                blind_distance = math.hypot(
+                    blind_position[0] - blind_start_position[0],
+                    blind_position[1] - blind_start_position[1]
+                )
+
+            if blind_position is not None and blind_distance <= blind_max_distance_m:
+                car_x, car_z, car_yaw = blind_position
+                last_position = blind_position
+                visual_filtered_position = blind_position
+                tracking_source = "BLIND"
+                # 把短时盲开预测位置写回历史，实现连续 dead reckoning。
+                append_motion_sample(
+                    motion_history, now, blind_position[0], blind_position[1],
+                    blind_position[2], motion_history_seconds
+                )
+            else:
+                print("[Blind] 盲开保护达到时间/距离上限，切换为保持当前位置")
+                blind_protection_active = False
+                blind_protection_armed = False
+                blind_started_at = None
+                blind_start_position = None
+                blind_status_message = "Blind protect limit: OFF"
+                blind_status_until = now + 2.0
+                if last_position is not None:
+                    car_x, car_z, car_yaw = last_position
+                    tracking_source = "LOST HOLD"
+                else:
+                    tracking_source = "LOST"
         elif last_position is not None:
             if blind_protection_active:
                 print("[Blind] 盲开保护超时，切换为保持当前位置")
                 blind_protection_active = False
                 blind_protection_armed = False
+                blind_started_at = None
+                blind_start_position = None
                 blind_status_message = "Blind protect timeout: OFF"
                 blind_status_until = now + 2.0
             car_x, car_z, car_yaw = last_position
@@ -1203,12 +1333,16 @@ def run_competition(cfg: dict):
         elif key == ord('1'):
             blind_protection_armed = True
             blind_protection_active = False
+            blind_started_at = None
+            blind_start_position = None
             blind_status_message = "Blind protect ARMED"
             blind_status_until = time.time() + 2.0
             print("[Blind] 已开启一次盲开保护：下一次车辆 Tag 丢失时开始外推")
         elif key == ord('0'):
             blind_protection_armed = False
             blind_protection_active = False
+            blind_started_at = None
+            blind_start_position = None
             blind_status_message = "Blind protect OFF"
             blind_status_until = time.time() + 2.0
             print("[Blind] 已关闭盲开保护")
