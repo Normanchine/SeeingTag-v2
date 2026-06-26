@@ -28,11 +28,13 @@
   "_comment_blind_drive": {
     "motion_history_seconds": "车标签识别正常时，保留最近多少秒的运动历史用于丢帧外推",
     "blind_drive_seconds": "车标签短暂丢失后，最多按历史速度和角速度盲开多少秒",
-    "position_hold_seconds": "历史样本不足时，最多保留上一可信位置多少秒"
+    "position_hold_seconds": "历史样本不足或盲开未开启时，保留上一可信位置多少秒后进入 LOST HOLD",
+    "yaw_log_interval_seconds": "控制台 yaw 输出间隔，单位秒"
   },
-  "motion_history_seconds": 4.0,
-  "blind_drive_seconds": 0.8,
+  "motion_history_seconds": 0.8,
+  "blind_drive_seconds": 0.6,
   "position_hold_seconds": 0.35,
+  "yaw_log_interval_seconds": 0.5,
   "homography_update_mode": "once",
   "homography_update_interval": 30,
 
