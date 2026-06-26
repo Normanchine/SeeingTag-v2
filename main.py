@@ -51,14 +51,17 @@ def load_config(path: str) -> dict:
         car_heading_offset = 0.0
 
     motion_history_seconds = cfg.get("motion_history_seconds", 4.0)
-    blind_drive_seconds = cfg.get("blind_drive_seconds", 0.8)
+    blind_drive_seconds = cfg.get("blind_drive_seconds", 1.2)
     position_hold_seconds = cfg.get("position_hold_seconds", 0.35)
+    yaw_log_interval_seconds = cfg.get("yaw_log_interval_seconds", 0.5)
     if motion_history_seconds <= 0.1:
         motion_history_seconds = 4.0
     if blind_drive_seconds < 0.0:
         blind_drive_seconds = 0.0
     if position_hold_seconds < 0.0:
         position_hold_seconds = 0.0
+    if yaw_log_interval_seconds <= 0.0:
+        yaw_log_interval_seconds = 0.5
     
     return {
         "tag_size_m": cfg["tag_size_m"],
@@ -78,6 +81,7 @@ def load_config(path: str) -> dict:
         "motion_history_seconds": float(motion_history_seconds),
         "blind_drive_seconds": float(blind_drive_seconds),
         "position_hold_seconds": float(position_hold_seconds),
+        "yaw_log_interval_seconds": float(yaw_log_interval_seconds),
         "homography_update_mode": homography_mode,
         "homography_update_interval": homography_interval,
         "bird_eye_only": cfg.get("bird_eye_only", False),
@@ -913,6 +917,7 @@ def run_competition(cfg: dict):
     bird_eye_only = cfg.get("bird_eye_only", False)
     print(f"  H矩阵更新模式: {h_mode}" + (f" (每{h_interval}帧)" if h_mode == "interval" else ""))
     print(f"  鸟瞰图专用模式: {'ON' if bird_eye_only else 'OFF'}")
+    print("  控制: 按 1 开启一次盲开保护，按 0 关闭盲开保护，按 R 重新校准，按 Q 退出")
 
     tracker = TagTracker(cfg)
     cap = open_camera()
@@ -966,13 +971,17 @@ def run_competition(cfg: dict):
 
     fps_time, fps_count, cur_fps = time.time(), 0, 0.0
     frame_no = 0
-    # 原图与鸟瞰图都短暂丢失时，先按近期运动趋势短时外推，再退回保留上一位置。
+    # 盲开保护需要手动开启；未开启时，识别丢失只保持上一位置，避免无效阶段乱预测。
     last_position: Optional[Tuple[float, float, float]] = None
     last_detection_time = 0.0
     position_hold_seconds = cfg["position_hold_seconds"]
     motion_history_seconds = cfg["motion_history_seconds"]
     blind_drive_seconds = cfg["blind_drive_seconds"]
+    yaw_log_interval_seconds = cfg["yaw_log_interval_seconds"]
     motion_history: Deque[Tuple[float, float, float, float]] = deque()
+    blind_protection_armed = False
+    blind_protection_active = False
+    last_yaw_log_time = 0.0
     visual_filtered_position: Optional[Tuple[float, float, float]] = None
     visual_filter_alpha = float(np.clip(cfg["filter_alpha"], 0.0, 1.0))
 
@@ -1058,6 +1067,10 @@ def run_competition(cfg: dict):
 
         now = time.time()
         if position_detected:
+            if blind_protection_active:
+                print("[Blind] 车辆 Tag 已恢复识别，盲开保护自动关闭")
+                blind_protection_active = False
+                blind_protection_armed = False
             car_x, car_z, car_yaw = tracker.transform_output_coordinates(car_x, car_z, car_yaw)
             if visual_filtered_position is None:
                 visual_filtered_position = (car_x, car_z, car_yaw if car_yaw is not None else 0.0)
@@ -1075,13 +1088,22 @@ def run_competition(cfg: dict):
                 motion_history, now, last_position[0], last_position[1],
                 last_position[2], motion_history_seconds
             )
-        elif (blind_position := predict_blind_position(motion_history, now, blind_drive_seconds)) is not None:
+        elif (blind_protection_armed
+              and (blind_position := predict_blind_position(motion_history, now, blind_drive_seconds)) is not None):
+            if not blind_protection_active:
+                print("[Blind] 车辆 Tag 识别丢失，开始按历史运动规律盲开")
+                blind_protection_active = True
             car_x, car_z, car_yaw = blind_position
             last_position = blind_position
+            visual_filtered_position = blind_position
             tracking_source = "BLIND"
-        elif last_position is not None and now - last_detection_time <= position_hold_seconds:
+        elif last_position is not None:
+            if blind_protection_active:
+                print("[Blind] 盲开保护超时，切换为保持当前位置")
+                blind_protection_active = False
+                blind_protection_armed = False
             car_x, car_z, car_yaw = last_position
-            tracking_source = "HOLD"
+            tracking_source = "HOLD" if now - last_detection_time <= position_hold_seconds else "LOST HOLD"
         else:
             tracking_source = "LOST"
 
@@ -1090,6 +1112,9 @@ def run_competition(cfg: dict):
             yaw_to_send = car_yaw if car_yaw is not None else 0.0
             tracking_state = tracking_source.lower().replace("-", "_").replace(" ", "_")
             tracker.send_position(car_x, car_z, yaw_to_send, tracking_state)
+            if now - last_yaw_log_time >= yaw_log_interval_seconds:
+                print(f"[Yaw] {yaw_to_send:.1f}° state={tracking_state}")
+                last_yaw_log_time = now
             if tracker.debug_logging and frame_no % 30 == 0:
                 x_trunc = truncate_to_2_decimals(car_x)
                 z_trunc = truncate_to_2_decimals(car_z)
@@ -1113,6 +1138,10 @@ def run_competition(cfg: dict):
         cv2.putText(display, f"Track: {tracking_source}", (10, display.shape[0] - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (0, 255, 0) if tracking_source == "RAW" else (0, 255, 255), 1)
+        blind_text = "Blind: ON" if blind_protection_armed else "Blind: OFF"
+        cv2.putText(display, blind_text, (10, display.shape[0] - 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (0, 255, 255) if blind_protection_armed else (160, 160, 160), 1)
         
         # 生成鸟瞰图
         bird_eye = tracker.generate_bird_eye_view(frame, detections, car_x, car_z, car_yaw)
@@ -1125,6 +1154,14 @@ def run_competition(cfg: dict):
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
+        elif key == ord('1'):
+            blind_protection_armed = True
+            blind_protection_active = False
+            print("[Blind] 已开启一次盲开保护：下一次车辆 Tag 丢失时开始外推")
+        elif key == ord('0'):
+            blind_protection_armed = False
+            blind_protection_active = False
+            print("[Blind] 已关闭盲开保护")
         elif key == ord('r'):
             # 按 R 键重新校准 H 矩阵
             print("[Recalibrate] 重新检测固定标签...")
