@@ -15,8 +15,8 @@
     "3": {"x": 0.0, "y": 0.0, "z": 0.0},
     "4": {"x": 5.0, "y": 0.0, "z": 0.0}
   },
-  "car_tag_id": 8,
-  "car_heading_offset_degrees": -46.92,
+  "car_tag_id": 10,
+  "car_heading_offset_degrees": -136.5,
   "flip_x": false,
   "flip_z": false,
 
@@ -25,9 +25,17 @@
     "interval": "每N帧更新一次H矩阵（推荐，平衡性能与容错）",
     "every_frame": "每帧都更新H矩阵（最稳定，性能最低）"
   },
+  "_comment_blind_drive": {
+    "motion_history_seconds": "车标签识别正常时，保留最近多少秒的运动历史用于丢帧外推",
+    "blind_drive_seconds": "车标签短暂丢失后，最多按历史速度和角速度盲开多少秒",
+    "position_hold_seconds": "历史样本不足时，最多保留上一可信位置多少秒"
+  },
+  "motion_history_seconds": 4.0,
+  "blind_drive_seconds": 0.8,
+  "position_hold_seconds": 0.35,
   "homography_update_mode": "once",
   "homography_update_interval": 30,
 
-  "bird_eye_only": false
+  "bird_eye_only": true
   
 }

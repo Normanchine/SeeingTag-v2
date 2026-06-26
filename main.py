@@ -14,7 +14,8 @@ import sys
 import os
 import argparse
 import math
-from typing import Dict, List, Optional, Tuple
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 
 def load_config(path: str) -> dict:
@@ -48,6 +49,16 @@ def load_config(path: str) -> dict:
     if not isinstance(car_heading_offset, (int, float)) or not math.isfinite(car_heading_offset):
         print("[WARN] 无效的 car_heading_offset_degrees，使用 0°")
         car_heading_offset = 0.0
+
+    motion_history_seconds = cfg.get("motion_history_seconds", 4.0)
+    blind_drive_seconds = cfg.get("blind_drive_seconds", 0.8)
+    position_hold_seconds = cfg.get("position_hold_seconds", 0.35)
+    if motion_history_seconds <= 0.1:
+        motion_history_seconds = 4.0
+    if blind_drive_seconds < 0.0:
+        blind_drive_seconds = 0.0
+    if position_hold_seconds < 0.0:
+        position_hold_seconds = 0.0
     
     return {
         "tag_size_m": cfg["tag_size_m"],
@@ -64,6 +75,9 @@ def load_config(path: str) -> dict:
         "tag_positions": tag_positions,
         "car_tag_id": cfg["car_tag_id"],
         "car_heading_offset_degrees": normalize_angle(float(car_heading_offset)),
+        "motion_history_seconds": float(motion_history_seconds),
+        "blind_drive_seconds": float(blind_drive_seconds),
+        "position_hold_seconds": float(position_hold_seconds),
         "homography_update_mode": homography_mode,
         "homography_update_interval": homography_interval,
         "bird_eye_only": cfg.get("bird_eye_only", False),
@@ -102,6 +116,42 @@ def smooth_angle(previous: float, current: float, alpha: float) -> float:
     """沿最短旋转方向平滑 yaw，避免 179° 到 -179° 时绕一整圈。"""
     delta = normalize_angle(current - previous)
     return normalize_angle(previous + alpha * delta)
+
+
+def append_motion_sample(history: Deque[Tuple[float, float, float, float]],
+                         timestamp: float, x: float, z: float, yaw: float,
+                         window_seconds: float):
+    """保存最近几秒的位置样本，用于车标签短时丢失时外推。"""
+    history.append((timestamp, x, z, yaw))
+    while history and timestamp - history[0][0] > window_seconds:
+        history.popleft()
+
+
+def predict_blind_position(history: Deque[Tuple[float, float, float, float]],
+                           timestamp: float, max_blind_seconds: float
+                           ) -> Optional[Tuple[float, float, float]]:
+    """按最近历史的平均平移速度和 yaw 角速度，短时预测车辆位置。"""
+    if len(history) < 2:
+        return None
+
+    first_t, first_x, first_z, first_yaw = history[0]
+    last_t, last_x, last_z, last_yaw = history[-1]
+    lost_seconds = timestamp - last_t
+    if lost_seconds < 0.0 or lost_seconds > max_blind_seconds:
+        return None
+
+    history_seconds = last_t - first_t
+    if history_seconds < 0.08:
+        return None
+
+    vx = (last_x - first_x) / history_seconds
+    vz = (last_z - first_z) / history_seconds
+    yaw_rate = normalize_angle(last_yaw - first_yaw) / history_seconds
+    return (
+        last_x + vx * lost_seconds,
+        last_z + vz * lost_seconds,
+        normalize_angle(last_yaw + yaw_rate * lost_seconds),
+    )
 
 
 class UdpSender:
@@ -916,10 +966,13 @@ def run_competition(cfg: dict):
 
     fps_time, fps_count, cur_fps = time.time(), 0, 0.0
     frame_no = 0
-    # 原图与鸟瞰图都短暂丢失时，保留最后一次可信位置，避免 Unity 中的车闪烁。
+    # 原图与鸟瞰图都短暂丢失时，先按近期运动趋势短时外推，再退回保留上一位置。
     last_position: Optional[Tuple[float, float, float]] = None
     last_detection_time = 0.0
-    position_hold_seconds = 0.35
+    position_hold_seconds = cfg["position_hold_seconds"]
+    motion_history_seconds = cfg["motion_history_seconds"]
+    blind_drive_seconds = cfg["blind_drive_seconds"]
+    motion_history: Deque[Tuple[float, float, float, float]] = deque()
     visual_filtered_position: Optional[Tuple[float, float, float]] = None
     visual_filter_alpha = float(np.clip(cfg["filter_alpha"], 0.0, 1.0))
 
@@ -1018,6 +1071,14 @@ def run_competition(cfg: dict):
             car_x, car_z, car_yaw = visual_filtered_position
             last_position = (car_x, car_z, car_yaw if car_yaw is not None else 0.0)
             last_detection_time = now
+            append_motion_sample(
+                motion_history, now, last_position[0], last_position[1],
+                last_position[2], motion_history_seconds
+            )
+        elif (blind_position := predict_blind_position(motion_history, now, blind_drive_seconds)) is not None:
+            car_x, car_z, car_yaw = blind_position
+            last_position = blind_position
+            tracking_source = "BLIND"
         elif last_position is not None and now - last_detection_time <= position_hold_seconds:
             car_x, car_z, car_yaw = last_position
             tracking_source = "HOLD"
