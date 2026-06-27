@@ -25,6 +25,7 @@
 - **H 缓存保护**：在 `interval` / `every_frame` 更新失败时保留上一份有效 H，不因固定码短暂离开画面而中断定位。
 - **稳定输出**：视觉层与 UDP 输出层分别平滑；偶发丢帧时保留最近可信位置 `0.35` 秒。
 - **可观测状态**：UDP 附带 `tracking_state`（`raw`、`bird_eye_fallback`、`hold`），便于 Unity 做状态提示。
+- **赛道调参窗口**：单独显示 `4m × 5m` 电子赛道图、固定 Tag ID、车辆轨迹、轨迹清除按钮和 K/P/D 保存按钮，方便现场观察定位与控制参数对齐。
 
 ## 快速开始
 
@@ -55,12 +56,27 @@ python main.py --calibrate
 |---|---|
 | `field_width_m` / `field_height_m` | 场地宽高（米） |
 | `unity_ip` / `unity_port` | Unity UDP 接收地址 |
+| `tuning_udp_enabled` | 是否启用 K/P/D 调参 UDP 发送 |
+| `tuning_ip` / `tuning_port` | K/P/D 调参接收端地址 |
+| `tuning_defaults` | 赛道调参窗口 K/P/D 滑条默认值 |
 | `homography_update_mode` | `once`、`interval` 或 `every_frame` |
 | `filter_alpha` | 鸟瞰图和 HUD 的位置/朝向平滑系数 |
 | `output_filter_alpha` | UDP 输出平滑系数 |
 | `flip_x` / `flip_z` | 镜像坐标与朝向，用于校正 Unity 坐标方向 |
 | `car_heading_offset_degrees` | 车头相对车载 Tag 默认方向的角度偏移（度）；会影响鸟瞰箭头和 Unity yaw |
 | `debug_logging` | 输出高频调试日志，比赛时建议关闭 |
+
+## 赛道调参窗口
+
+比赛模式启动后会额外打开 `Track Map - 4x5` 窗口：
+
+- 赛道底图来自 `track_map_clean.png`，固定 Tag 会按 `tag_config.json` 标出 ID 1~4。
+- 黄色轨迹线显示车辆历史位置；点 `Clear Trail` 或按 `T` 可以清空轨迹。
+- `LeftIn` 滑条用于微调左侧弯道红色中线显示，解决电子图和实际赛道中线略有偏差的问题。
+- `K` / `P` / `D` 滑条对应 SmartCar 上位机里的 `pwm_k`、`pid_p`、`pid_d`。
+- 点 `Save KPD` 时只发送一次 UDP 包，意图是让接收端保存参数，SmartCar app 下次启动再读取生效；它不是实时调参。
+
+如果换了赛道底图，可以运行 `track_calibrate.py` 重新点选四个角，生成 `track_calib.json`，让实际 `5m × 4m` 场地坐标映射到图上的正确位置。
 
 ## 调整车头方向
 
@@ -90,6 +106,11 @@ python main.py --show-car-heading
 .
 ├── main.py                    # 视觉定位、鸟瞰图、UDP 主程序
 ├── tag_config.json            # 标签布局、场地、网络和滤波配置
+├── track_calibrate.py         # 赛道底图四角标定工具
+├── track_calib.json           # 赛道底图到 5m × 4m 场地坐标的映射
+├── track_display_tune.json    # 赛道窗口显示微调参数
+├── track_map_clean.png        # 去除尺寸标注后的赛道底图
+├── track_map_source.png       # 原始赛道底图
 ├── generate_tag.py            # 生成固定/车载 ArUco Tag
 ├── calibrate_camera.py        # 棋盘格相机标定工具（可选）
 ├── test_*.py                  # 摄像头、IPM、UDP 调试工具
