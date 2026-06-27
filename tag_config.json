@@ -9,6 +9,14 @@
   "debug_logging": false,
   "unity_ip": "192.168.43.226",
   "unity_port": 9005,
+  "tuning_udp_enabled": true,
+  "tuning_ip": "127.0.0.1",
+  "tuning_port": 9010,
+  "tuning_defaults": {
+    "k": 30.0,
+    "p": 1.0,
+    "d": 0.1
+  },
   "tag_world_positions": {
     "1": {"x": 5.0, "y": 0.0, "z": 4.0},
     "2": {"x": 0.0, "y": 0.0, "z": 4.0},

@@ -111,6 +111,10 @@ def load_config(path: str) -> dict:
         "homography_update_mode": homography_mode,
         "homography_update_interval": homography_interval,
         "bird_eye_only": cfg.get("bird_eye_only", False),
+        "tuning_udp_enabled": cfg.get("tuning_udp_enabled", True),
+        "tuning_ip": cfg.get("tuning_ip", "127.0.0.1"),
+        "tuning_port": cfg.get("tuning_port", 9010),
+        "tuning_defaults": cfg.get("tuning_defaults", {"k": 30.0, "p": 1.0, "d": 0.10}),
     }
 
 
@@ -322,6 +326,49 @@ class UdpSender:
             return True
         except Exception as e:
             print(f"[UDP] 发送失败: {e}")
+            return False
+
+    def close(self):
+        self.sock.close()
+
+
+class TuningUdpSender:
+    """Send K/P/D tuning values for SmartCar to save and apply on next restart."""
+
+    def __init__(self, target_ip: str, target_port: int, enabled: bool = True):
+        self.target = (target_ip, int(target_port))
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.enabled = bool(enabled)
+        self.seq = 0
+
+    def send_once(self, k: float, p: float, d: float) -> bool:
+        if not self.enabled:
+            return False
+
+        values = (round(float(k), 3), round(float(p), 3), round(float(d), 3))
+        now = time.time()
+        data = {
+            "type": "control_tuning",
+            "version": 1,
+            "action": "save_next_restart",
+            "seq": self.seq,
+            "timestamp": now,
+            "params": {
+                "pwm_k": values[0],
+                "pid_p": values[1],
+                "pid_d": values[2],
+            },
+        }
+        try:
+            self.sock.sendto(json.dumps(data, separators=(",", ":")).encode("utf-8"), self.target)
+            self.seq += 1
+            print(
+                f"[TuneUDP] save_next_restart -> {self.target[0]}:{self.target[1]} "
+                f"K={values[0]:.2f} P={values[1]:.2f} D={values[2]:.2f}"
+            )
+            return True
+        except OSError as e:
+            print(f"[TuneUDP] 发送失败: {e}")
             return False
 
     def close(self):
@@ -974,6 +1021,10 @@ class TrackMapVisualizer:
         self.history: Deque[Tuple[int, int]] = deque(maxlen=2000)
         self.H_track: Optional[np.ndarray] = None
         self.clear_button_rect = (52, 76, 194, 116)
+        self.send_button_rect = (206, 76, 348, 116)
+        self.pending_tune_send = False
+        self.tune_status_text = "Tune: edit sliders, click Save KPD"
+        self.tune_status_until = 0.0
 
         base_dir = os.path.dirname(__file__)
         self.display_tune = self._load_display_tune(base_dir)
@@ -990,9 +1041,10 @@ class TrackMapVisualizer:
         self._load_calibration(base_dir)
 
         cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.createTrackbar("Kp", self.WINDOW_NAME, 100, 2000, self._noop)
-        cv2.createTrackbar("Ki", self.WINDOW_NAME, 0, 2000, self._noop)
-        cv2.createTrackbar("Kd", self.WINDOW_NAME, 10, 2000, self._noop)
+        defaults = cfg.get("tuning_defaults", {})
+        cv2.createTrackbar("K", self.WINDOW_NAME, int(float(defaults.get("k", 30.0)) * 10), 2000, self._noop)
+        cv2.createTrackbar("P", self.WINDOW_NAME, int(float(defaults.get("p", 1.0)) * 100), 2000, self._noop)
+        cv2.createTrackbar("D", self.WINDOW_NAME, int(float(defaults.get("d", 0.10)) * 100), 2000, self._noop)
         cv2.createTrackbar("LeftIn", self.WINDOW_NAME, self.left_curve_inset_px, 80, self._noop)
         cv2.setMouseCallback(self.WINDOW_NAME, self._on_mouse)
 
@@ -1183,15 +1235,17 @@ class TrackMapVisualizer:
                 cv2.arrowedLine(display, (px, py), end, (0, 0, 255), 2,
                                 cv2.LINE_AA, tipLength=0.35)
 
-        kp, ki, kd = self.get_pid_values()
-        cv2.rectangle(display, (52, 8), (394, 72), (255, 255, 255), -1)
-        cv2.putText(display, f"Kp:{kp:.2f} Ki:{ki:.2f} Kd:{kd:.2f}", (62, 32),
+        k, p, d = self.get_tuning_values()
+        cv2.rectangle(display, (52, 8), (420, 72), (255, 255, 255), -1)
+        cv2.putText(display, f"K:{k:.1f} P:{p:.2f} D:{d:.2f}", (62, 32),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.58, (25, 25, 25), 2)
         cv2.putText(display, f"Track:{tracking_source}", (62, 58),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
-        cv2.putText(display, f"LeftIn:{self.left_curve_inset_px}px", (206, 102),
+        cv2.putText(display, f"LeftIn:{self.left_curve_inset_px}px", (360, 102),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
         self._draw_clear_button(display)
+        self._draw_send_button(display)
+        self._draw_tune_status(display)
         return display
 
     def _draw_clear_button(self, display: np.ndarray):
@@ -1201,12 +1255,31 @@ class TrackMapVisualizer:
         cv2.putText(display, "Clear Trail", (x1 + 11, y1 + 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 2)
 
+    def _draw_send_button(self, display: np.ndarray):
+        x1, y1, x2, y2 = self.send_button_rect
+        cv2.rectangle(display, (x1, y1), (x2, y2), (235, 250, 235), -1)
+        cv2.rectangle(display, (x1, y1), (x2, y2), (35, 120, 35), 2)
+        cv2.putText(display, "Save KPD", (x1 + 18, y1 + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 90, 20), 2)
+
+    def _draw_tune_status(self, display: np.ndarray):
+        text = self.tune_status_text
+        color = (90, 90, 90)
+        if time.time() < self.tune_status_until:
+            color = (0, 130, 0) if text.startswith("Tune: saved") else (0, 0, 200)
+        cv2.putText(display, text, (52, 140),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.47, color, 1)
+
     def _on_mouse(self, event: int, x: int, y: int, flags: int, param):
         if event != cv2.EVENT_LBUTTONDOWN:
             return
         x1, y1, x2, y2 = self.clear_button_rect
         if x1 <= x <= x2 and y1 <= y <= y2:
             self.clear_history()
+            return
+        x1, y1, x2, y2 = self.send_button_rect
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            self.pending_tune_send = True
 
     def _draw_fixed_tags(self, display: np.ndarray):
         for tag_id, pos in self.tag_positions.items():
@@ -1218,11 +1291,24 @@ class TrackMapVisualizer:
             cv2.putText(display, str(tag_id), (label_px - 7, label_py + 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
 
-    def get_pid_values(self) -> Tuple[float, float, float]:
-        kp = cv2.getTrackbarPos("Kp", self.WINDOW_NAME) / 100.0
-        ki = cv2.getTrackbarPos("Ki", self.WINDOW_NAME) / 100.0
-        kd = cv2.getTrackbarPos("Kd", self.WINDOW_NAME) / 100.0
-        return kp, ki, kd
+    def get_tuning_values(self) -> Tuple[float, float, float]:
+        k = cv2.getTrackbarPos("K", self.WINDOW_NAME) / 10.0
+        p = cv2.getTrackbarPos("P", self.WINDOW_NAME) / 100.0
+        d = cv2.getTrackbarPos("D", self.WINDOW_NAME) / 100.0
+        return k, p, d
+
+    def consume_tune_send_requested(self) -> bool:
+        if not self.pending_tune_send:
+            return False
+        self.pending_tune_send = False
+        return True
+
+    def mark_tune_sent(self, k: float, p: float, d: float, ok: bool):
+        if ok:
+            self.tune_status_text = f"Tune: saved K={k:.1f} P={p:.2f} D={d:.2f}, restart SmartCar"
+        else:
+            self.tune_status_text = "Tune: send failed or disabled"
+        self.tune_status_until = time.time() + 3.0
 
     def show(self, image: np.ndarray):
         cv2.imshow(self.WINDOW_NAME, image)
@@ -1297,13 +1383,21 @@ def run_competition(cfg: dict):
     bird_eye_only = cfg.get("bird_eye_only", False)
     print(f"  H矩阵更新模式: {h_mode}" + (f" (每{h_interval}帧)" if h_mode == "interval" else ""))
     print(f"  鸟瞰图专用模式: {'ON' if bird_eye_only else 'OFF'}")
-    print("  控制: 按 1 开启盲开保护，按 0 关闭盲开保护，点 Clear Trail 或按 T 清空轨迹，按 R 重新校准，按 Q 退出")
+    print("  控制: 按 1 开启盲开保护，按 0 关闭盲开保护，点 Clear Trail 或按 T 清空轨迹，点 Save KPD 保存下次启动参数，按 R 重新校准，按 Q 退出")
 
     tracker = TagTracker(cfg)
     cap = open_camera()
     print(f"[Homography] 固定标签: {list(cfg['tag_positions'].keys())}")
     print(f"[Homography] 车标签ID: {cfg['car_tag_id']}")
     track_map = TrackMapVisualizer(cfg, tracker.tag_positions)
+    tuning_udp = TuningUdpSender(
+        cfg["tuning_ip"], cfg["tuning_port"], cfg["tuning_udp_enabled"]
+    )
+    print(
+        f"[TuneUDP] {'ON' if cfg['tuning_udp_enabled'] else 'OFF'} "
+        f"-> {cfg['tuning_ip']}:{cfg['tuning_port']} "
+        "(click Save KPD to save for next SmartCar restart)"
+    )
 
     # 等待 H 矩阵初始化（必须检测到全部 4 个固定标签）
     print(f"[Homography] 等待固定标签检测...")
@@ -1344,6 +1438,7 @@ def run_competition(cfg: dict):
         
         if cv2.waitKey(1) & 0xFF == ord('q'):
             cap.release()
+            tuning_udp.close()
             cv2.destroyAllWindows()
             return
     
@@ -1608,6 +1703,10 @@ def run_competition(cfg: dict):
 
         track_map.append_position(car_x, car_z)
         track_display = track_map.draw(car_x, car_z, car_yaw, tracking_source)
+        if track_map.consume_tune_send_requested():
+            k, p, d = track_map.get_tuning_values()
+            ok = tuning_udp.send_once(k, p, d)
+            track_map.mark_tune_sent(k, p, d, ok)
 
         # 同时显示窗口
         cv2.imshow("SeeingTag - Original View", display)
@@ -1657,6 +1756,7 @@ def run_competition(cfg: dict):
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     cap.release()
                     tracker.close()
+                    tuning_udp.close()
                     cv2.destroyAllWindows()
                     return
             print("[Recalibrate] 完成！")
@@ -1665,6 +1765,7 @@ def run_competition(cfg: dict):
 
     cap.release()
     tracker.close()
+    tuning_udp.close()
     cv2.destroyAllWindows()
 
 
