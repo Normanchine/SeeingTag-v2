@@ -4,8 +4,8 @@
   "field_height_m": 4.0,
   "fov_degrees": 66.1,
   "min_tag_width_pixels": 5,
-  "filter_alpha": 0.3,
-  "output_filter_alpha": 0.08,
+  "filter_alpha": 0.45,
+  "output_filter_alpha": 0.25,
   "debug_logging": false,
   "unity_ip": "192.168.43.226",
   "unity_port": 9005,
@@ -36,7 +36,8 @@
     "blind_max_yaw_rate_dps": "盲开 yaw 角速度上限，单位 度/秒",
     "blind_yaw_rate_decay_per_second": "盲开持续时 yaw 角速度每秒衰减比例，越小越快趋向直线",
     "blind_max_speed_mps": "盲开速度上限，单位 米/秒",
-    "blind_max_distance_m": "单次盲开最大距离，超过后自动关闭保护并保持当前位置"
+    "blind_max_distance_m": "单次盲开最大距离，超过后自动关闭保护并保持当前位置",
+    "blind_trigger_frames": "连续多少帧识别不到才触发盲开，防单帧误丢"
   },
   "motion_history_seconds": 3.0,
   "blind_drive_seconds": 2.0,
@@ -49,6 +50,7 @@
   "blind_yaw_rate_decay_per_second": 0.75,
   "blind_max_speed_mps": 1.2,
   "blind_max_distance_m": 0.45,
+  "blind_trigger_frames": 5,
   "homography_update_mode": "once",
   "homography_update_interval": 30,
 

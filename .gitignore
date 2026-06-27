@@ -5,3 +5,6 @@ __pycache__/
 # Local virtual environments
 venv/
 .venv/
+
+# Generated track-map preview
+track_map_preview.png

@@ -962,6 +962,276 @@ def open_camera(camera_index: Optional[int] = None) -> cv2.VideoCapture:
     return cap
 
 
+class TrackMapVisualizer:
+    """赛道调参窗口：底图、固定标签、车辆轨迹和 PID 滑条都集中在这里。"""
+
+    WINDOW_NAME = "Track Map - 4x5"
+
+    def __init__(self, cfg: dict, tag_positions: Dict[int, np.ndarray]):
+        self.field_width = float(cfg.get("field_width_m", 5.0))
+        self.field_height = float(cfg.get("field_height_m", 4.0))
+        self.tag_positions = tag_positions
+        self.history: Deque[Tuple[int, int]] = deque(maxlen=2000)
+        self.H_track: Optional[np.ndarray] = None
+        self.clear_button_rect = (52, 76, 194, 116)
+
+        base_dir = os.path.dirname(__file__)
+        self.display_tune = self._load_display_tune(base_dir)
+        self.image_path = self._resolve_image_path(base_dir)
+        self.raw_base_img = self._load_base_image(self.image_path)
+        self.track_h, self.track_w = self.raw_base_img.shape[:2]
+        self.left_curve_inset_px = int(np.clip(
+            self.display_tune.get("left_curve_centerline_inset_px", 0), 0, 80
+        ))
+        self._last_left_curve_inset_px = self.left_curve_inset_px
+        self.base_img = self._apply_left_curve_centerline_inset(
+            self.raw_base_img, self.left_curve_inset_px
+        )
+        self._load_calibration(base_dir)
+
+        cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.createTrackbar("Kp", self.WINDOW_NAME, 100, 2000, self._noop)
+        cv2.createTrackbar("Ki", self.WINDOW_NAME, 0, 2000, self._noop)
+        cv2.createTrackbar("Kd", self.WINDOW_NAME, 10, 2000, self._noop)
+        cv2.createTrackbar("LeftIn", self.WINDOW_NAME, self.left_curve_inset_px, 80, self._noop)
+        cv2.setMouseCallback(self.WINDOW_NAME, self._on_mouse)
+
+    @staticmethod
+    def _noop(_: int):
+        pass
+
+    def _resolve_image_path(self, base_dir: str) -> str:
+        candidates = [
+            os.path.join(base_dir, "track_map_clean.png"),
+            os.path.join(base_dir, "track_map_source.png"),
+            os.path.join(base_dir, "image.png"),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return candidates[0]
+
+    def _load_base_image(self, image_path: str) -> np.ndarray:
+        if os.path.exists(image_path):
+            img = cv2.imread(image_path)
+            if img is not None:
+                return img
+
+        img = np.full((675, 884, 3), 255, dtype=np.uint8)
+        cv2.rectangle(img, (40, 40), (844, 635), (40, 40, 40), 2)
+        cv2.putText(img, "4m x 5m Track Map", (40, 82),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (80, 80, 80), 2)
+        return img
+
+    def _load_display_tune(self, base_dir: str) -> dict:
+        tune_path = os.path.join(base_dir, "track_display_tune.json")
+        defaults = {
+            "left_curve_center_px": [305, 356],
+            "left_curve_max_x_px": 540,
+            "left_curve_centerline_inset_px": 32,
+        }
+        if not os.path.exists(tune_path):
+            return defaults
+        try:
+            with open(tune_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            defaults.update(loaded)
+        except Exception as e:
+            print(f"[TrackMap] Failed to load track_display_tune.json: {e}")
+        return defaults
+
+    def _apply_left_curve_centerline_inset(self, image: np.ndarray, inset_px: int) -> np.ndarray:
+        if inset_px <= 0:
+            return image.copy()
+
+        tuned = image.copy()
+        center = self.display_tune.get("left_curve_center_px", [305, 356])
+        cx, cy = float(center[0]), float(center[1])
+        max_x = int(self.display_tune.get("left_curve_max_x_px", 540))
+
+        red_mask = (
+            (image[:, :, 2] > 170) &
+            (image[:, :, 1] < 150) &
+            (image[:, :, 0] < 150)
+        )
+        red_mask[:, max(0, min(max_x, image.shape[1] - 1)):] = False
+
+        if not np.any(red_mask):
+            return tuned
+
+        erase_mask = cv2.dilate(red_mask.astype(np.uint8) * 255, np.ones((5, 5), dtype=np.uint8))
+        tuned[erase_mask > 0] = (255, 255, 255)
+
+        ys, xs = np.nonzero(red_mask)
+        dx = xs.astype(np.float32) - cx
+        dy = ys.astype(np.float32) - cy
+        radius = np.sqrt(dx * dx + dy * dy)
+        valid = radius > 1.0
+        scale = np.ones_like(radius)
+        scale[valid] = np.maximum(1.0, radius[valid] - float(inset_px)) / radius[valid]
+        new_xs = np.rint(cx + dx * scale).astype(np.int32)
+        new_ys = np.rint(cy + dy * scale).astype(np.int32)
+
+        valid = (
+            (new_xs >= 0) & (new_xs < tuned.shape[1]) &
+            (new_ys >= 0) & (new_ys < tuned.shape[0])
+        )
+        shifted_mask = np.zeros(tuned.shape[:2], dtype=np.uint8)
+        shifted_mask[new_ys[valid], new_xs[valid]] = 255
+        shifted_mask = cv2.dilate(shifted_mask, np.ones((3, 3), dtype=np.uint8))
+        tuned[shifted_mask > 0] = (80, 80, 255)
+        return tuned
+
+    def _refresh_centerline_tune(self):
+        inset_px = cv2.getTrackbarPos("LeftIn", self.WINDOW_NAME)
+        if inset_px == self._last_left_curve_inset_px:
+            return
+        self.left_curve_inset_px = inset_px
+        self._last_left_curve_inset_px = inset_px
+        self.base_img = self._apply_left_curve_centerline_inset(
+            self.raw_base_img, self.left_curve_inset_px
+        )
+
+    def _load_calibration(self, base_dir: str):
+        calib_path = os.path.join(base_dir, "track_calib.json")
+        if not os.path.exists(calib_path):
+            print("[TrackMap] No track_calib.json, using linear 4x5 mapping.")
+            return
+
+        try:
+            with open(calib_path, "r", encoding="utf-8") as f:
+                cobj = json.load(f)
+            raw_H = np.array(cobj["H"], dtype=np.float32)
+            calib_image = cobj.get("image")
+            H = raw_H
+
+            # track_calib.json may have been clicked on a different-size image.
+            # Scale the world->pixel homography into the image actually shown now.
+            if calib_image:
+                if not os.path.exists(calib_image):
+                    print(f"[TrackMap] Calibration image missing, ignoring H: {calib_image}")
+                    return
+                src_img = cv2.imread(calib_image)
+                if src_img is None:
+                    print(f"[TrackMap] Calibration image unreadable, ignoring H: {calib_image}")
+                    return
+                src_h, src_w = src_img.shape[:2]
+                if src_w > 0 and src_h > 0 and (src_w != self.track_w or src_h != self.track_h):
+                    scale = np.array([
+                        [self.track_w / src_w, 0.0, 0.0],
+                        [0.0, self.track_h / src_h, 0.0],
+                        [0.0, 0.0, 1.0],
+                    ], dtype=np.float32)
+                    H = scale @ raw_H
+
+            self.H_track = H
+            print(f"[TrackMap] Loaded {calib_path}: {os.path.basename(self.image_path)}")
+        except Exception as e:
+            print(f"[TrackMap] Failed to load track_calib.json: {e}")
+            self.H_track = None
+
+    def world_to_px(self, x: float, z: float) -> Tuple[int, int]:
+        if self.H_track is not None:
+            try:
+                pt = np.array([[[float(x), float(z)]]], dtype=np.float32)
+                dst = cv2.perspectiveTransform(pt, self.H_track)
+                px = int(round(float(dst[0, 0, 0])))
+                py = int(round(float(dst[0, 0, 1])))
+                return self._clip_px(px, py)
+            except Exception:
+                pass
+
+        fx = min(max(0.0, float(x)), self.field_width)
+        fz = min(max(0.0, float(z)), self.field_height)
+        px = int((fx / self.field_width) * (self.track_w - 1))
+        py = int(((self.field_height - fz) / self.field_height) * (self.track_h - 1))
+        return self._clip_px(px, py)
+
+    def _clip_px(self, px: int, py: int) -> Tuple[int, int]:
+        return (
+            max(0, min(px, self.track_w - 1)),
+            max(0, min(py, self.track_h - 1)),
+        )
+
+    def append_position(self, x: Optional[float], z: Optional[float]):
+        if x is None or z is None:
+            return
+        self.history.append(self.world_to_px(x, z))
+
+    def draw(self, car_x: Optional[float], car_z: Optional[float],
+             car_yaw: Optional[float], tracking_source: str) -> np.ndarray:
+        self._refresh_centerline_tune()
+        display = self.base_img.copy()
+        self._draw_fixed_tags(display)
+
+        if len(self.history) > 1:
+            pts = np.array(self.history, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(display, [pts], isClosed=False, color=(0, 210, 255), thickness=2)
+
+        if car_x is not None and car_z is not None:
+            px, py = self.world_to_px(car_x, car_z)
+            cv2.circle(display, (px, py), 7, (0, 0, 255), -1)
+            if car_yaw is not None:
+                heading_len = 28
+                # Track map uses a visual arrow only; the detected tag yaw points opposite
+                # to the car nose on the physical mounting, so flip it for this window.
+                yaw_rad = math.radians(normalize_angle(car_yaw + 180.0))
+                end = (
+                    int(round(px + math.cos(yaw_rad) * heading_len)),
+                    int(round(py - math.sin(yaw_rad) * heading_len)),
+                )
+                cv2.arrowedLine(display, (px, py), end, (0, 0, 255), 2,
+                                cv2.LINE_AA, tipLength=0.35)
+
+        kp, ki, kd = self.get_pid_values()
+        cv2.rectangle(display, (52, 8), (394, 72), (255, 255, 255), -1)
+        cv2.putText(display, f"Kp:{kp:.2f} Ki:{ki:.2f} Kd:{kd:.2f}", (62, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (25, 25, 25), 2)
+        cv2.putText(display, f"Track:{tracking_source}", (62, 58),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
+        cv2.putText(display, f"LeftIn:{self.left_curve_inset_px}px", (206, 102),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
+        self._draw_clear_button(display)
+        return display
+
+    def _draw_clear_button(self, display: np.ndarray):
+        x1, y1, x2, y2 = self.clear_button_rect
+        cv2.rectangle(display, (x1, y1), (x2, y2), (245, 245, 245), -1)
+        cv2.rectangle(display, (x1, y1), (x2, y2), (40, 40, 40), 2)
+        cv2.putText(display, "Clear Trail", (x1 + 11, y1 + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 2)
+
+    def _on_mouse(self, event: int, x: int, y: int, flags: int, param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        x1, y1, x2, y2 = self.clear_button_rect
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            self.clear_history()
+
+    def _draw_fixed_tags(self, display: np.ndarray):
+        for tag_id, pos in self.tag_positions.items():
+            px, py = self.world_to_px(float(pos[0]), float(pos[2]))
+            label_px = max(18, min(px, self.track_w - 19))
+            label_py = max(18, min(py, self.track_h - 19))
+            cv2.circle(display, (label_px, label_py), 13, (0, 160, 255), -1)
+            cv2.circle(display, (label_px, label_py), 13, (255, 255, 255), 2)
+            cv2.putText(display, str(tag_id), (label_px - 7, label_py + 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+
+    def get_pid_values(self) -> Tuple[float, float, float]:
+        kp = cv2.getTrackbarPos("Kp", self.WINDOW_NAME) / 100.0
+        ki = cv2.getTrackbarPos("Ki", self.WINDOW_NAME) / 100.0
+        kd = cv2.getTrackbarPos("Kd", self.WINDOW_NAME) / 100.0
+        return kp, ki, kd
+
+    def show(self, image: np.ndarray):
+        cv2.imshow(self.WINDOW_NAME, image)
+
+    def clear_history(self):
+        self.history.clear()
+        print("[TrackMap] 已清空轨迹")
+
+
 def run_calibration(cfg: dict):
     print("=== Calibration Mode — 不发 UDP，按 C 打印调试信息 ===")
     tracker = TagTracker(cfg)
@@ -1022,18 +1292,19 @@ def run_competition(cfg: dict):
     print(f"  Unity → {cfg['unity_ip']}:{cfg['unity_port']}")
     
     # 获取 H 矩阵更新模式
-    h_mode = cfg.get("homography_update_mode", "interval")
+    h_mode = cfg.get("homography_update_mode", "interval") 
     h_interval = cfg.get("homography_update_interval", 30)
     bird_eye_only = cfg.get("bird_eye_only", False)
     print(f"  H矩阵更新模式: {h_mode}" + (f" (每{h_interval}帧)" if h_mode == "interval" else ""))
     print(f"  鸟瞰图专用模式: {'ON' if bird_eye_only else 'OFF'}")
-    print("  控制: 按 1 开启一次盲开保护，按 0 关闭盲开保护，按 R 重新校准，按 Q 退出")
+    print("  控制: 按 1 开启盲开保护，按 0 关闭盲开保护，点 Clear Trail 或按 T 清空轨迹，按 R 重新校准，按 Q 退出")
 
     tracker = TagTracker(cfg)
     cap = open_camera()
     print(f"[Homography] 固定标签: {list(cfg['tag_positions'].keys())}")
     print(f"[Homography] 车标签ID: {cfg['car_tag_id']}")
-    
+    track_map = TrackMapVisualizer(cfg, tracker.tag_positions)
+
     # 等待 H 矩阵初始化（必须检测到全部 4 个固定标签）
     print(f"[Homography] 等待固定标签检测...")
     while not tracker.homography_valid:
@@ -1095,9 +1366,12 @@ def run_competition(cfg: dict):
     blind_yaw_rate_decay_per_second = cfg["blind_yaw_rate_decay_per_second"]
     blind_max_speed_mps = cfg["blind_max_speed_mps"]
     blind_max_distance_m = cfg["blind_max_distance_m"]
+    blind_trigger_frames = cfg.get("blind_trigger_frames", 0)
     motion_history: Deque[Tuple[float, float, float, float]] = deque()
     blind_protection_armed = False
     blind_protection_active = False
+    blind_keep_armed = False  # True = 按1持久模式，恢复后自动重挂
+    lost_frame_count = 0
     blind_started_at: Optional[float] = None
     blind_start_position: Optional[Tuple[float, float]] = None
     last_yaw_log_time = 0.0
@@ -1187,11 +1461,18 @@ def run_competition(cfg: dict):
                             print("[Tracking] 原图未识别到车标签，鸟瞰图兜底识别成功")
 
         now = time.time()
+        # 连续丢帧计数：识别到归零，没识别到累加
+        if position_detected:
+            lost_frame_count = 0
+        else:
+            lost_frame_count += 1
+
         if position_detected:
             if blind_protection_active:
                 print("[Blind] 车辆 Tag 已恢复识别，盲开保护自动关闭")
                 blind_protection_active = False
-                blind_protection_armed = False
+                if not blind_keep_armed:
+                    blind_protection_armed = False
                 blind_started_at = None
                 blind_start_position = None
                 blind_status_message = "Blind protect auto OFF: tag recovered"
@@ -1213,7 +1494,7 @@ def run_competition(cfg: dict):
                 motion_history, now, last_position[0], last_position[1],
                 last_position[2], motion_history_seconds
             )
-        elif blind_protection_armed:
+        elif blind_protection_armed and lost_frame_count >= blind_trigger_frames:
             if not blind_protection_active:
                 print("[Blind] 车辆 Tag 识别丢失，开始按历史运动规律盲开")
                 blind_status_message = "Blind driving..."
@@ -1309,11 +1590,14 @@ def run_competition(cfg: dict):
         cv2.putText(display, f"Track: {tracking_source}", (10, display.shape[0] - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (0, 255, 0) if tracking_source == "RAW" else (0, 255, 255), 1)
-        blind_text = "Blind: ON" if blind_protection_armed else "Blind: OFF"
+        blind_text = "Blind: ALWAYS ON" if blind_keep_armed else ("Blind: ON" if blind_protection_armed else "Blind: OFF")
+        blind_color = (0, 255, 255) if blind_protection_armed else (160, 160, 160)
+        if blind_keep_armed:
+            blind_color = (255, 180, 0)  # 橙色表示持久模式
         cv2.putText(display, blind_text, (10, display.shape[0] - 70),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    (0, 255, 255) if blind_protection_armed else (160, 160, 160), 1)
-        
+                    blind_color, 1)
+
         # 生成鸟瞰图
         bird_eye = tracker.generate_bird_eye_view(frame, detections, car_x, car_z, car_yaw)
         if bird_eye is not None:
@@ -1322,23 +1606,29 @@ def run_competition(cfg: dict):
                 blind_status_message, time.time() < blind_status_until
             )
 
-        # 同时显示两个窗口
+        track_map.append_position(car_x, car_z)
+        track_display = track_map.draw(car_x, car_z, car_yaw, tracking_source)
+
+        # 同时显示窗口
         cv2.imshow("SeeingTag - Original View", display)
         if bird_eye is not None:
             cv2.imshow("SeeingTag - Bird Eye View", bird_eye)
+        track_map.show(track_display)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
         elif key == ord('1'):
+            blind_keep_armed = True
             blind_protection_armed = True
             blind_protection_active = False
             blind_started_at = None
             blind_start_position = None
-            blind_status_message = "Blind protect ARMED"
+            blind_status_message = "Blind protect ALWAYS ON"
             blind_status_until = time.time() + 2.0
-            print("[Blind] 已开启一次盲开保护：下一次车辆 Tag 丢失时开始外推")
+            print("[Blind] 盲开持久开启：标签恢复后自动重挂")
         elif key == ord('0'):
+            blind_keep_armed = False
             blind_protection_armed = False
             blind_protection_active = False
             blind_started_at = None
@@ -1346,6 +1636,8 @@ def run_competition(cfg: dict):
             blind_status_message = "Blind protect OFF"
             blind_status_until = time.time() + 2.0
             print("[Blind] 已关闭盲开保护")
+        elif key == ord('t'):
+            track_map.clear_history()
         elif key == ord('r'):
             # 按 R 键重新校准 H 矩阵
             print("[Recalibrate] 重新检测固定标签...")
