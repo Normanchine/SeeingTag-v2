@@ -10,7 +10,7 @@
   "unity_ip": "192.168.43.226",
   "unity_port": 9005,
   "tuning_udp_enabled": true,
-  "tuning_ip": "127.0.0.1",
+  "tuning_ip": "192.168.43.226",
   "tuning_port": 9010,
   "tuning_defaults": {
     "k": 30.0,
@@ -62,5 +62,16 @@
   "homography_update_mode": "once",
   "homography_update_interval": 30,
 
-  "bird_eye_only": true
+  "bird_eye_only": false,
+  "camera_target_fps": 60,
+  "camera_thread_enabled": true,
+  "display_enabled": true,
+  "display_fps": 12,
+  "show_original_view": true,
+  "show_bird_eye_view": false,
+  "show_track_map": true,
+  "bird_eye_fallback_enabled": true,
+  "fallback_bird_eye_width": 800,
+  "fallback_bird_eye_height": 640,
+  "perf_stats_enabled": true
 }

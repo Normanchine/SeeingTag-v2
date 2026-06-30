@@ -14,6 +14,7 @@ import sys
 import os
 import argparse
 import math
+import threading
 from collections import deque
 from typing import Deque, Dict, List, Optional, Tuple
 
@@ -111,6 +112,17 @@ def load_config(path: str) -> dict:
         "homography_update_mode": homography_mode,
         "homography_update_interval": homography_interval,
         "bird_eye_only": cfg.get("bird_eye_only", False),
+        "camera_thread_enabled": cfg.get("camera_thread_enabled", True),
+        "display_enabled": cfg.get("display_enabled", True),
+        "display_fps": max(1.0, float(cfg.get("display_fps", 12.0))),
+        "show_original_view": cfg.get("show_original_view", True),
+        "show_bird_eye_view": cfg.get("show_bird_eye_view", False),
+        "show_track_map": cfg.get("show_track_map", True),
+        "bird_eye_fallback_enabled": cfg.get("bird_eye_fallback_enabled", True),
+        "fallback_bird_eye_width": int(cfg.get("fallback_bird_eye_width", 800)),
+        "fallback_bird_eye_height": int(cfg.get("fallback_bird_eye_height", 640)),
+        "perf_stats_enabled": cfg.get("perf_stats_enabled", True),
+        "camera_target_fps": float(cfg.get("camera_target_fps", 60.0)),
         "tuning_udp_enabled": cfg.get("tuning_udp_enabled", True),
         "tuning_ip": cfg.get("tuning_ip", "127.0.0.1"),
         "tuning_port": cfg.get("tuning_port", 9010),
@@ -415,6 +427,7 @@ class TagTracker:
         self.homography_valid = False
         # 标记 H 矩阵是否已初始化（用于 "once" 模式）
         self.homography_initialized = False
+        self.bird_eye_transform_cache: Dict[Tuple[int, int], Tuple[np.ndarray, dict]] = {}
 
     def detect(self, gray: np.ndarray) -> List[dict]:
         """
@@ -489,6 +502,7 @@ class TagTracker:
         if H is not None:
             self.H = H
             self.homography_valid = True
+            self.bird_eye_transform_cache.clear()
             inlier_count = int(np.sum(mask))
             if self.debug_logging:
                 print(f"[Homography] 计算成功: {len(src_pts)}个点, {inlier_count}个内点")
@@ -497,6 +511,7 @@ class TagTracker:
             if not keep_existing:
                 self.homography_valid = False
                 self.H = None
+                self.bird_eye_transform_cache.clear()
             return False
 
     def compute_yaw_from_corners(self, corners: np.ndarray) -> Optional[float]:
@@ -624,42 +639,49 @@ class TagTracker:
         if not self.homography_valid or self.H is None:
             return None
 
-        # 场地为 5m × 4m，四周留出 0.5m，便于观察边缘的车标签。
-        margin = 0.5
-        world_min_x, world_max_x = -margin, self.field_width + margin
-        world_min_z, world_max_z = -margin, self.field_height + margin
-        scale_x = output_width / (world_max_x - world_min_x)
-        scale_z = output_height / (world_max_z - world_min_z)
+        cache_key = (int(output_width), int(output_height))
+        cached = self.bird_eye_transform_cache.get(cache_key)
+        if cached is None:
+            # H 固定后，鸟瞰变换矩阵和世界坐标换算参数也固定。
+            margin = 0.5
+            world_min_x, world_max_x = -margin, self.field_width + margin
+            world_min_z, world_max_z = -margin, self.field_height + margin
+            scale_x = output_width / (world_max_x - world_min_x)
+            scale_z = output_height / (world_max_z - world_min_z)
 
-        world_corners = np.array([
-            [world_min_x, world_min_z, 1],
-            [world_max_x, world_min_z, 1],
-            [world_max_x, world_max_z, 1],
-            [world_min_x, world_max_z, 1]
-        ], dtype=np.float64)
+            world_corners = np.array([
+                [world_min_x, world_min_z, 1],
+                [world_max_x, world_min_z, 1],
+                [world_max_x, world_max_z, 1],
+                [world_min_x, world_max_z, 1]
+            ], dtype=np.float64)
 
-        H_inv = np.linalg.inv(self.H)
-        src_pts = []
-        for corner in world_corners:
-            pixel = H_inv @ corner
-            pixel = pixel / pixel[2]
-            src_pts.append([pixel[0], pixel[1]])
-        src_pts = np.array(src_pts, dtype=np.float32)
-        dst_pts = np.array([
-            [0, 0], [output_width, 0],
-            [output_width, output_height], [0, output_height]
-        ], dtype=np.float32)
+            H_inv = np.linalg.inv(self.H)
+            src_pts = []
+            for corner in world_corners:
+                pixel = H_inv @ corner
+                pixel = pixel / pixel[2]
+                src_pts.append([pixel[0], pixel[1]])
+            src_pts = np.array(src_pts, dtype=np.float32)
+            dst_pts = np.array([
+                [0, 0], [output_width, 0],
+                [output_width, output_height], [0, output_height]
+            ], dtype=np.float32)
 
-        transform = cv2.getPerspectiveTransform(src_pts, dst_pts)
+            transform = cv2.getPerspectiveTransform(src_pts, dst_pts)
+            transform_info = {
+                "world_min_x": world_min_x,
+                "world_min_z": world_min_z,
+                "scale_x": scale_x,
+                "scale_z": scale_z,
+            }
+            cached = (transform, transform_info)
+            self.bird_eye_transform_cache[cache_key] = cached
+        transform, transform_info = cached
         bird_eye = cv2.warpPerspective(
             frame, transform, (output_width, output_height), flags=cv2.INTER_CUBIC
         )
-        return bird_eye, {
-            "world_min_x": world_min_x,
-            "world_min_z": world_min_z,
-            "scale_x": scale_x,
-            "scale_z": scale_z,
-        }
+        return bird_eye, transform_info
 
     def locate_car_in_bird_eye(self, bird_eye: np.ndarray, transform_info: dict) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         """在已拉正的鸟瞰图中检测车标签，作为原图检测失败时的兜底。"""
@@ -941,7 +963,7 @@ def select_camera() -> int:
             sys.exit(0)
 
 
-def open_camera(camera_index: Optional[int] = None) -> cv2.VideoCapture:
+def open_camera(camera_index: Optional[int] = None, target_fps: float = 60.0) -> cv2.VideoCapture:
     """
     打开本地 USB 摄像头
     参数:
@@ -974,7 +996,7 @@ def open_camera(camera_index: Optional[int] = None) -> cv2.VideoCapture:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_FPS, target_fps)
         time.sleep(0.3)
         
         # 验证设置是否生效
@@ -1009,8 +1031,122 @@ def open_camera(camera_index: Optional[int] = None) -> cv2.VideoCapture:
     return cap
 
 
+class LatestFrameCamera:
+    """后台读取摄像头，只向处理循环交付最新的一帧。"""
+
+    def __init__(self, cap: cv2.VideoCapture):
+        self.cap = cap
+        self.lock = threading.Lock()
+        self.cond = threading.Condition(self.lock)
+        self.latest_frame: Optional[np.ndarray] = None
+        self.latest_id = 0
+        self.delivered_id = 0
+        self.running = True
+        self.frames_read = 0
+        self.thread = threading.Thread(target=self._loop, name="LatestFrameCamera", daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret or frame is None:
+                time.sleep(0.002)
+                continue
+            with self.cond:
+                self.latest_frame = frame
+                self.latest_id += 1
+                self.frames_read += 1
+                self.cond.notify_all()
+
+    def read(self, timeout: float = 0.05) -> Tuple[bool, Optional[np.ndarray]]:
+        end_time = time.time() + timeout
+        with self.cond:
+            while self.running and self.latest_id == self.delivered_id:
+                remaining = end_time - time.time()
+                if remaining <= 0:
+                    return False, None
+                self.cond.wait(remaining)
+            if self.latest_frame is None:
+                return False, None
+            self.delivered_id = self.latest_id
+            return True, self.latest_frame
+
+    def release(self):
+        self.running = False
+        with self.cond:
+            self.cond.notify_all()
+        self.thread.join(timeout=1.0)
+        self.cap.release()
+
+
+class PerfStats:
+    """每秒输出摄像头、处理、发送和主要耗时，方便判断瓶颈。"""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.window_start = time.time()
+        self.camera_start_frames = 0
+        self.process_count = 0
+        self.send_count = 0
+        self.detect_ms: List[float] = []
+        self.warp_ms: List[float] = []
+        self.display_ms: List[float] = []
+        self.frame_ms: List[float] = []
+
+    def mark_send(self):
+        if self.enabled:
+            self.send_count += 1
+
+    def record_frame(self, frame_ms: float, detect_ms: float, warp_ms: float, display_ms: float):
+        if not self.enabled:
+            return
+        self.process_count += 1
+        self.frame_ms.append(frame_ms)
+        self.detect_ms.append(detect_ms)
+        self.warp_ms.append(warp_ms)
+        self.display_ms.append(display_ms)
+
+    @staticmethod
+    def _avg(values: List[float]) -> float:
+        return float(sum(values) / len(values)) if values else 0.0
+
+    @staticmethod
+    def _p95(values: List[float]) -> float:
+        if not values:
+            return 0.0
+        sorted_values = sorted(values)
+        idx = min(len(sorted_values) - 1, int(len(sorted_values) * 0.95))
+        return float(sorted_values[idx])
+
+    def maybe_print(self, camera_frames: int):
+        if not self.enabled:
+            return
+        now = time.time()
+        elapsed = now - self.window_start
+        if elapsed < 1.0:
+            return
+        camera_fps = (camera_frames - self.camera_start_frames) / elapsed
+        process_fps = self.process_count / elapsed
+        send_fps = self.send_count / elapsed
+        print(
+            "[Perf] "
+            f"camera={camera_fps:.1f}fps process={process_fps:.1f}fps send={send_fps:.1f}fps "
+            f"detect={self._avg(self.detect_ms):.1f}ms warp={self._avg(self.warp_ms):.1f}ms "
+            f"display={self._avg(self.display_ms):.1f}ms frame_avg={self._avg(self.frame_ms):.1f}ms "
+            f"frame_p95={self._p95(self.frame_ms):.1f}ms"
+        )
+        self.window_start = now
+        self.camera_start_frames = camera_frames
+        self.process_count = 0
+        self.send_count = 0
+        self.detect_ms.clear()
+        self.warp_ms.clear()
+        self.display_ms.clear()
+        self.frame_ms.clear()
+
+
 class TrackMapVisualizer:
-    """赛道调参窗口：底图、固定标签、车辆轨迹和 PID 滑条都集中在这里。"""
+    """赛道调参窗口：底图、固定标签、车辆轨迹和 PID 数值输入都集中在这里。"""
 
     WINDOW_NAME = "Track Map - 4x5"
 
@@ -1020,11 +1156,27 @@ class TrackMapVisualizer:
         self.tag_positions = tag_positions
         self.history: Deque[Tuple[int, int]] = deque(maxlen=2000)
         self.H_track: Optional[np.ndarray] = None
-        self.clear_button_rect = (52, 76, 194, 116)
-        self.send_button_rect = (206, 76, 348, 116)
+        self.clear_button_rect = (52, 112, 194, 152)
+        self.send_button_rect = (206, 112, 348, 152)
         self.pending_tune_send = False
-        self.tune_status_text = "Tune: edit sliders, click Save KPD"
+        self.tune_status_text = "Tune: click K/P/D or note, then type"
         self.tune_status_until = 0.0
+        defaults = cfg.get("tuning_defaults", {})
+        self.tune_values = {
+            "k": float(defaults.get("k", 30.0)),
+            "p": float(defaults.get("p", 1.0)),
+            "d": float(defaults.get("d", 0.10)),
+        }
+        self.tune_steps = {"k": 1.0, "p": 0.05, "d": 0.01}
+        self.active_input: Optional[str] = None
+        self.edit_buffer = ""
+        self.note_text = ""
+        self.note_active = False
+        self.tune_log_path = os.path.join(os.path.dirname(__file__), "调参记录.md")
+        self.value_rects: Dict[str, Tuple[int, int, int, int]] = {}
+        self.minus_rects: Dict[str, Tuple[int, int, int, int]] = {}
+        self.plus_rects: Dict[str, Tuple[int, int, int, int]] = {}
+        self.note_rect = (52, 72, 520, 104)
 
         base_dir = os.path.dirname(__file__)
         self.display_tune = self._load_display_tune(base_dir)
@@ -1041,16 +1193,7 @@ class TrackMapVisualizer:
         self._load_calibration(base_dir)
 
         cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
-        defaults = cfg.get("tuning_defaults", {})
-        cv2.createTrackbar("K", self.WINDOW_NAME, int(float(defaults.get("k", 30.0)) * 10), 2000, self._noop)
-        cv2.createTrackbar("P", self.WINDOW_NAME, int(float(defaults.get("p", 1.0)) * 100), 2000, self._noop)
-        cv2.createTrackbar("D", self.WINDOW_NAME, int(float(defaults.get("d", 0.10)) * 100), 2000, self._noop)
-        cv2.createTrackbar("LeftIn", self.WINDOW_NAME, self.left_curve_inset_px, 80, self._noop)
         cv2.setMouseCallback(self.WINDOW_NAME, self._on_mouse)
-
-    @staticmethod
-    def _noop(_: int):
-        pass
 
     def _resolve_image_path(self, base_dir: str) -> str:
         candidates = [
@@ -1135,14 +1278,7 @@ class TrackMapVisualizer:
         return tuned
 
     def _refresh_centerline_tune(self):
-        inset_px = cv2.getTrackbarPos("LeftIn", self.WINDOW_NAME)
-        if inset_px == self._last_left_curve_inset_px:
-            return
-        self.left_curve_inset_px = inset_px
-        self._last_left_curve_inset_px = inset_px
-        self.base_img = self._apply_left_curve_centerline_inset(
-            self.raw_base_img, self.left_curve_inset_px
-        )
+        return
 
     def _load_calibration(self, base_dir: str):
         calib_path = os.path.join(base_dir, "track_calib.json")
@@ -1235,18 +1371,70 @@ class TrackMapVisualizer:
                 cv2.arrowedLine(display, (px, py), end, (0, 0, 255), 2,
                                 cv2.LINE_AA, tipLength=0.35)
 
-        k, p, d = self.get_tuning_values()
-        cv2.rectangle(display, (52, 8), (420, 72), (255, 255, 255), -1)
-        cv2.putText(display, f"K:{k:.1f} P:{p:.2f} D:{d:.2f}", (62, 32),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (25, 25, 25), 2)
-        cv2.putText(display, f"Track:{tracking_source}", (62, 58),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
-        cv2.putText(display, f"LeftIn:{self.left_curve_inset_px}px", (360, 102),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
+        self._draw_tune_panel(display, tracking_source)
         self._draw_clear_button(display)
         self._draw_send_button(display)
         self._draw_tune_status(display)
         return display
+
+    def _draw_tune_panel(self, display: np.ndarray, tracking_source: str):
+        cv2.rectangle(display, (42, 6), (548, 158), (255, 255, 255), -1)
+        cv2.rectangle(display, (42, 6), (548, 158), (210, 210, 210), 1)
+
+        x = 58
+        for name, label, width in (("k", "K", 92), ("p", "P", 92), ("d", "D", 92)):
+            y1, y2 = 18, 50
+            cv2.putText(display, label, (x, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20, 20, 20), 2)
+            minus = (x + 26, y1, x + 56, y2)
+            value = (x + 60, y1, x + 60 + width, y2)
+            plus = (x + 64 + width, y1, x + 94 + width, y2)
+            self.minus_rects[name] = minus
+            self.value_rects[name] = value
+            self.plus_rects[name] = plus
+
+            active = self.active_input == name
+            self._draw_small_button(display, minus, "-")
+            self._draw_value_box(display, value, self._format_tune_value(name), active)
+            self._draw_small_button(display, plus, "+")
+            x = plus[2] + 24
+
+        x1, y1, x2, y2 = self.note_rect
+        cv2.rectangle(display, (x1, y1), (x2, y2), (248, 248, 248), -1)
+        cv2.rectangle(display, (x1, y1), (x2, y2),
+                      (0, 120, 220) if self.note_active else (170, 170, 170), 2)
+        shown_note = self.note_text if self.note_text else "note..."
+        shown_note = shown_note[-58:]
+        cv2.putText(display, f"Note: {shown_note}", (x1 + 8, y1 + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                    (40, 40, 40) if self.note_text else (130, 130, 130), 1)
+        cv2.putText(display, f"Track:{tracking_source}  LeftIn:{self.left_curve_inset_px}px",
+                    (360, 142), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 80, 80), 1)
+
+    def _draw_small_button(self, display: np.ndarray, rect: Tuple[int, int, int, int], text: str):
+        x1, y1, x2, y2 = rect
+        cv2.rectangle(display, (x1, y1), (x2, y2), (238, 238, 238), -1)
+        cv2.rectangle(display, (x1, y1), (x2, y2), (85, 85, 85), 1)
+        cv2.putText(display, text, (x1 + 9, y1 + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, (30, 30, 30), 2)
+
+    def _draw_value_box(self, display: np.ndarray, rect: Tuple[int, int, int, int],
+                        text: str, active: bool):
+        x1, y1, x2, y2 = rect
+        cv2.rectangle(display, (x1, y1), (x2, y2), (255, 255, 255), -1)
+        cv2.rectangle(display, (x1, y1), (x2, y2),
+                      (0, 120, 220) if active else (130, 130, 130), 2)
+        cv2.putText(display, text, (x1 + 8, y1 + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (20, 20, 20), 1)
+
+    def _format_tune_value(self, name: str) -> str:
+        if self.active_input == name:
+            return self.edit_buffer or ""
+        if name == "k":
+            return f"{self.tune_values[name]:.1f}"
+        if name == "p":
+            return f"{self.tune_values[name]:.2f}"
+        return f"{self.tune_values[name]:.2f}"
 
     def _draw_clear_button(self, display: np.ndarray):
         x1, y1, x2, y2 = self.clear_button_rect
@@ -1267,19 +1455,112 @@ class TrackMapVisualizer:
         color = (90, 90, 90)
         if time.time() < self.tune_status_until:
             color = (0, 130, 0) if text.startswith("Tune: saved") else (0, 0, 200)
-        cv2.putText(display, text, (52, 140),
+        cv2.putText(display, text, (52, 178),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.47, color, 1)
 
     def _on_mouse(self, event: int, x: int, y: int, flags: int, param):
         if event != cv2.EVENT_LBUTTONDOWN:
             return
+        for name, rect in self.minus_rects.items():
+            if self._point_in_rect(x, y, rect):
+                self._finish_numeric_edit()
+                self._adjust_tune_value(name, -1.0, flags)
+                return
+        for name, rect in self.plus_rects.items():
+            if self._point_in_rect(x, y, rect):
+                self._finish_numeric_edit()
+                self._adjust_tune_value(name, 1.0, flags)
+                return
+        for name, rect in self.value_rects.items():
+            if self._point_in_rect(x, y, rect):
+                self._start_numeric_edit(name)
+                return
+        if self._point_in_rect(x, y, self.note_rect):
+            self._finish_numeric_edit()
+            self.note_active = True
+            return
+        self._finish_numeric_edit()
+        self.note_active = False
         x1, y1, x2, y2 = self.clear_button_rect
         if x1 <= x <= x2 and y1 <= y <= y2:
             self.clear_history()
             return
         x1, y1, x2, y2 = self.send_button_rect
         if x1 <= x <= x2 and y1 <= y <= y2:
+            self._finish_numeric_edit()
             self.pending_tune_send = True
+
+    @staticmethod
+    def _point_in_rect(x: int, y: int, rect: Tuple[int, int, int, int]) -> bool:
+        x1, y1, x2, y2 = rect
+        return x1 <= x <= x2 and y1 <= y <= y2
+
+    def _start_numeric_edit(self, name: str):
+        if name == "k":
+            self.edit_buffer = f"{self.tune_values[name]:.1f}"
+        else:
+            self.edit_buffer = f"{self.tune_values[name]:.2f}"
+        self.active_input = name
+        self.note_active = False
+        self.tune_status_text = f"Tune: editing {name.upper()}"
+
+    def _finish_numeric_edit(self):
+        if self.active_input is None:
+            return
+        try:
+            value = float(self.edit_buffer)
+            self.tune_values[self.active_input] = self._clamp_tune_value(self.active_input, value)
+        except ValueError:
+            self.tune_status_text = f"Tune: invalid {self.active_input.upper()} value"
+            self.tune_status_until = time.time() + 2.0
+        self.active_input = None
+        self.edit_buffer = ""
+
+    def _adjust_tune_value(self, name: str, direction: float, flags: int):
+        scale = 10.0 if flags & cv2.EVENT_FLAG_SHIFTKEY else 1.0
+        value = self.tune_values[name] + direction * self.tune_steps[name] * scale
+        self.tune_values[name] = self._clamp_tune_value(name, value)
+
+    @staticmethod
+    def _clamp_tune_value(name: str, value: float) -> float:
+        if name == "k":
+            return float(np.clip(value, 0.0, 2000.0))
+        if name == "p":
+            return float(np.clip(value, 0.0, 20.0))
+        return float(np.clip(value, 0.0, 20.0))
+
+    def handle_key(self, key: int) -> bool:
+        if key < 0 or key == 255:
+            return False
+        if self.active_input is not None:
+            if key in (13, 10):
+                self._finish_numeric_edit()
+                return True
+            if key == 27:
+                self.active_input = None
+                self.edit_buffer = ""
+                return True
+            if key in (8, 127):
+                self.edit_buffer = self.edit_buffer[:-1]
+                return True
+            ch = chr(key) if 32 <= key <= 126 else ""
+            if ch.isdigit() or ch in ".-":
+                self.edit_buffer += ch
+                return True
+            return True
+        if self.note_active:
+            if key in (13, 10, 27):
+                self.note_active = False
+                return True
+            if key in (8, 127):
+                self.note_text = self.note_text[:-1]
+                return True
+            ch = chr(key) if 32 <= key <= 126 else ""
+            if ch:
+                self.note_text = (self.note_text + ch)[-160:]
+                return True
+            return True
+        return False
 
     def _draw_fixed_tags(self, display: np.ndarray):
         for tag_id, pos in self.tag_positions.items():
@@ -1292,10 +1573,8 @@ class TrackMapVisualizer:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
 
     def get_tuning_values(self) -> Tuple[float, float, float]:
-        k = cv2.getTrackbarPos("K", self.WINDOW_NAME) / 10.0
-        p = cv2.getTrackbarPos("P", self.WINDOW_NAME) / 100.0
-        d = cv2.getTrackbarPos("D", self.WINDOW_NAME) / 100.0
-        return k, p, d
+        self._finish_numeric_edit()
+        return self.tune_values["k"], self.tune_values["p"], self.tune_values["d"]
 
     def consume_tune_send_requested(self) -> bool:
         if not self.pending_tune_send:
@@ -1308,7 +1587,26 @@ class TrackMapVisualizer:
             self.tune_status_text = f"Tune: saved K={k:.1f} P={p:.2f} D={d:.2f}, restart SmartCar"
         else:
             self.tune_status_text = "Tune: send failed or disabled"
+        self._append_tune_log(k, p, d, ok)
         self.tune_status_until = time.time() + 3.0
+
+    def _append_tune_log(self, k: float, p: float, d: float, ok: bool):
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        status = "sent" if ok else "send failed or disabled"
+        note = self.note_text.strip() or "none"
+        first_write = not os.path.exists(self.tune_log_path)
+        try:
+            with open(self.tune_log_path, "a", encoding="utf-8", newline="\n") as f:
+                if first_write:
+                    f.write("# 调参记录\n\n")
+                f.write(f"## {timestamp}\n\n")
+                f.write(f"- K: {k:.1f}\n")
+                f.write(f"- P: {p:.2f}\n")
+                f.write(f"- D: {d:.2f}\n")
+                f.write(f"- Status: {status}\n")
+                f.write(f"- Note: {note}\n\n")
+        except Exception as e:
+            print(f"[TuneLog] Failed to write {self.tune_log_path}: {e}")
 
     def show(self, image: np.ndarray):
         cv2.imshow(self.WINDOW_NAME, image)
@@ -1381,15 +1679,27 @@ def run_competition(cfg: dict):
     h_mode = cfg.get("homography_update_mode", "interval") 
     h_interval = cfg.get("homography_update_interval", 30)
     bird_eye_only = cfg.get("bird_eye_only", False)
+    display_enabled = cfg.get("display_enabled", True)
+    display_interval = 1.0 / cfg.get("display_fps", 12.0)
+    show_original_view = cfg.get("show_original_view", True)
+    show_bird_eye_view = cfg.get("show_bird_eye_view", False)
+    show_track_map = cfg.get("show_track_map", True)
+    fallback_enabled = cfg.get("bird_eye_fallback_enabled", True)
+    fallback_width = cfg.get("fallback_bird_eye_width", 800)
+    fallback_height = cfg.get("fallback_bird_eye_height", 640)
     print(f"  H矩阵更新模式: {h_mode}" + (f" (每{h_interval}帧)" if h_mode == "interval" else ""))
     print(f"  鸟瞰图专用模式: {'ON' if bird_eye_only else 'OFF'}")
+    print(f"  显示刷新: {'ON' if display_enabled else 'OFF'}" + (f" @ {cfg.get('display_fps', 12):.0f}fps" if display_enabled else ""))
     print("  控制: 按 1 开启盲开保护，按 0 关闭盲开保护，点 Clear Trail 或按 T 清空轨迹，点 Save KPD 保存下次启动参数，按 R 重新校准，按 Q 退出")
 
     tracker = TagTracker(cfg)
-    cap = open_camera()
+    raw_cap = open_camera(target_fps=cfg.get("camera_target_fps", 60.0))
+    cap = LatestFrameCamera(raw_cap) if cfg.get("camera_thread_enabled", True) else raw_cap
+    if cfg.get("camera_thread_enabled", True):
+        print("[Camera] 最新帧采集线程: ON（旧帧直接覆盖，不排队）")
     print(f"[Homography] 固定标签: {list(cfg['tag_positions'].keys())}")
     print(f"[Homography] 车标签ID: {cfg['car_tag_id']}")
-    track_map = TrackMapVisualizer(cfg, tracker.tag_positions)
+    track_map = TrackMapVisualizer(cfg, tracker.tag_positions) if display_enabled and show_track_map else None
     tuning_udp = TuningUdpSender(
         cfg["tuning_ip"], cfg["tuning_port"], cfg["tuning_udp_enabled"]
     )
@@ -1418,29 +1728,27 @@ def run_competition(cfg: dict):
             tracker.compute_homography(detections)
         
         # 显示等待状态（同时绘制检测框）
-        display = frame.copy()
-        
-        # 绘制检测框
-        for d in detections:
-            color = (0, 255, 0) if d["id"] in tracker.tag_positions else (0, 128, 255)
-            pts = d["corners"].astype(np.int32)
-            cv2.polylines(display, [pts], True, color, 2)
-            cx, cy = int(d['corners'][0][0]), int(d['corners'][0][1])
-            label = "CAR" if d["id"] == tracker.car_tag_id else f"ID:{d['id']}"
-            cv2.putText(display, label, (cx, cy - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        
-        # 显示等待提示
-        status = "OK! Initializing..." if all_fixed_found else f"Waiting... ({fixed_count}/{len(tracker.tag_positions)})"
-        cv2.putText(display, status, 
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.imshow("SeeingTag - Original View", display)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            cap.release()
-            tuning_udp.close()
-            cv2.destroyAllWindows()
-            return
+        if display_enabled and show_original_view:
+            display = frame.copy()
+            for d in detections:
+                color = (0, 255, 0) if d["id"] in tracker.tag_positions else (0, 128, 255)
+                pts = d["corners"].astype(np.int32)
+                cv2.polylines(display, [pts], True, color, 2)
+                cx, cy = int(d['corners'][0][0]), int(d['corners'][0][1])
+                label = "CAR" if d["id"] == tracker.car_tag_id else f"ID:{d['id']}"
+                cv2.putText(display, label, (cx, cy - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            status = "OK! Initializing..." if all_fixed_found else f"Waiting... ({fixed_count}/{len(tracker.tag_positions)})"
+            cv2.putText(display, status,
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.imshow("SeeingTag - Original View", display)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                cap.release()
+                tuning_udp.close()
+                cv2.destroyAllWindows()
+                return
     
     print(f"[Homography] 初始化完成！开始追踪车标签...")
     tracker.homography_initialized = True
@@ -1474,17 +1782,23 @@ def run_competition(cfg: dict):
     blind_status_until = 0.0
     visual_filtered_position: Optional[Tuple[float, float, float]] = None
     visual_filter_alpha = float(np.clip(cfg["filter_alpha"], 0.0, 1.0))
+    last_display_time = 0.0
+    perf = PerfStats(cfg.get("perf_stats_enabled", True))
 
     while True:
+        frame_start = time.perf_counter()
         ret, frame = cap.read()
         if not ret or frame is None:
-            cv2.waitKey(10)
+            if display_enabled:
+                cv2.waitKey(1)
             continue
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # 根据检测模式决定策略
         detections = []
+        detect_start = time.perf_counter()
+        warp_ms = 0.0
         if bird_eye_only:
             # ---- 鸟瞰图专用模式 ----
             # 仍需定期检测固定标签以更新 H 矩阵
@@ -1499,7 +1813,9 @@ def run_competition(cfg: dict):
 
             # 跳过原图车检测，直接用鸟瞰图
             car_x, car_z, car_yaw = None, None, None
-            bird_warped = tracker.warp_to_bird_eye(frame, 1600, 1280)
+            warp_start = time.perf_counter()
+            bird_warped = tracker.warp_to_bird_eye(frame, fallback_width, fallback_height)
+            warp_ms += (time.perf_counter() - warp_start) * 1000.0
             if bird_warped is not None:
                 bird_eye_img, transform_info = bird_warped
                 car_x, car_z, car_yaw = tracker.locate_car_in_bird_eye(
@@ -1542,8 +1858,10 @@ def run_competition(cfg: dict):
             position_detected = car_x is not None and car_z is not None
 
             # 原图识别失败时，才生成高分辨率鸟瞰图进行第二次检测。
-            if not position_detected:
-                fallback_warped = tracker.warp_to_bird_eye(frame, 1600, 1280)
+            if not position_detected and fallback_enabled:
+                warp_start = time.perf_counter()
+                fallback_warped = tracker.warp_to_bird_eye(frame, fallback_width, fallback_height)
+                warp_ms += (time.perf_counter() - warp_start) * 1000.0
                 if fallback_warped is not None:
                     fallback_bird_eye, transform_info = fallback_warped
                     car_x, car_z, car_yaw = tracker.locate_car_in_bird_eye(
@@ -1554,6 +1872,7 @@ def run_competition(cfg: dict):
                         tracking_source = "BIRD-EYE FALLBACK"
                         if tracker.debug_logging:
                             print("[Tracking] 原图未识别到车标签，鸟瞰图兜底识别成功")
+        detect_ms = (time.perf_counter() - detect_start) * 1000.0 - warp_ms
 
         now = time.time()
         # 连续丢帧计数：识别到归零，没识别到累加
@@ -1655,6 +1974,7 @@ def run_competition(cfg: dict):
             yaw_to_send = car_yaw if car_yaw is not None else 0.0
             tracking_state = tracking_source.lower().replace("-", "_").replace(" ", "_")
             tracker.send_position(car_x, car_z, yaw_to_send, tracking_state)
+            perf.mark_send()
             if now - last_yaw_log_time >= yaw_log_interval_seconds:
                 print(f"[Yaw] {yaw_to_send:.1f}° state={tracking_state}")
                 last_yaw_log_time = now
@@ -1670,51 +1990,62 @@ def run_competition(cfg: dict):
             fps_count = 0
             fps_time = time.time()
 
-        display = tracker.draw_hud(frame, detections, car_x, car_z, car_yaw, cur_fps)
-        draw_blind_status_overlay(
-            display, blind_protection_armed, blind_protection_active,
-            blind_status_message, time.time() < blind_status_until
-        )
-        
-        # 添加模式显示
-        mode_text = f"H-Mode: {h_mode}"
-        if h_mode == "interval":
-            mode_text += f" (N={h_interval})"
-        cv2.putText(display, mode_text, (10, display.shape[0] - 45),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        cv2.putText(display, f"Track: {tracking_source}", (10, display.shape[0] - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    (0, 255, 0) if tracking_source == "RAW" else (0, 255, 255), 1)
-        blind_text = "Blind: ALWAYS ON" if blind_keep_armed else ("Blind: ON" if blind_protection_armed else "Blind: OFF")
-        blind_color = (0, 255, 255) if blind_protection_armed else (160, 160, 160)
-        if blind_keep_armed:
-            blind_color = (255, 180, 0)  # 橙色表示持久模式
-        cv2.putText(display, blind_text, (10, display.shape[0] - 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    blind_color, 1)
+        key = 255
+        display_ms = 0.0
+        if display_enabled and now - last_display_time >= display_interval:
+            display_start = time.perf_counter()
+            if show_original_view:
+                display = tracker.draw_hud(frame, detections, car_x, car_z, car_yaw, cur_fps)
+                draw_blind_status_overlay(
+                    display, blind_protection_armed, blind_protection_active,
+                    blind_status_message, time.time() < blind_status_until
+                )
 
-        # 生成鸟瞰图
-        bird_eye = tracker.generate_bird_eye_view(frame, detections, car_x, car_z, car_yaw)
-        if bird_eye is not None:
-            draw_blind_status_overlay(
-                bird_eye, blind_protection_armed, blind_protection_active,
-                blind_status_message, time.time() < blind_status_until
-            )
+                mode_text = f"H-Mode: {h_mode}"
+                if h_mode == "interval":
+                    mode_text += f" (N={h_interval})"
+                cv2.putText(display, mode_text, (10, display.shape[0] - 45),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                cv2.putText(display, f"Track: {tracking_source}", (10, display.shape[0] - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 255, 0) if tracking_source == "RAW" else (0, 255, 255), 1)
+                blind_text = "Blind: ALWAYS ON" if blind_keep_armed else ("Blind: ON" if blind_protection_armed else "Blind: OFF")
+                blind_color = (0, 255, 255) if blind_protection_armed else (160, 160, 160)
+                if blind_keep_armed:
+                    blind_color = (255, 180, 0)
+                cv2.putText(display, blind_text, (10, display.shape[0] - 70),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            blind_color, 1)
+                cv2.imshow("SeeingTag - Original View", display)
 
-        track_map.append_position(car_x, car_z)
-        track_display = track_map.draw(car_x, car_z, car_yaw, tracking_source)
-        if track_map.consume_tune_send_requested():
-            k, p, d = track_map.get_tuning_values()
-            ok = tuning_udp.send_once(k, p, d)
-            track_map.mark_tune_sent(k, p, d, ok)
+            if show_bird_eye_view:
+                bird_eye = tracker.generate_bird_eye_view(frame, detections, car_x, car_z, car_yaw)
+                if bird_eye is not None:
+                    draw_blind_status_overlay(
+                        bird_eye, blind_protection_armed, blind_protection_active,
+                        blind_status_message, time.time() < blind_status_until
+                    )
+                    cv2.imshow("SeeingTag - Bird Eye View", bird_eye)
 
-        # 同时显示窗口
-        cv2.imshow("SeeingTag - Original View", display)
-        if bird_eye is not None:
-            cv2.imshow("SeeingTag - Bird Eye View", bird_eye)
-        track_map.show(track_display)
+            if track_map is not None:
+                track_map.append_position(car_x, car_z)
+                track_display = track_map.draw(car_x, car_z, car_yaw, tracking_source)
+                if track_map.consume_tune_send_requested():
+                    k, p, d = track_map.get_tuning_values()
+                    ok = tuning_udp.send_once(k, p, d)
+                    track_map.mark_tune_sent(k, p, d, ok)
+                track_map.show(track_display)
 
-        key = cv2.waitKey(1) & 0xFF
+            key = cv2.waitKey(1) & 0xFF
+            if track_map is not None and track_map.handle_key(key):
+                key = 255
+            last_display_time = now
+            display_ms = (time.perf_counter() - display_start) * 1000.0
+
+        frame_ms = (time.perf_counter() - frame_start) * 1000.0
+        perf.record_frame(frame_ms, max(0.0, detect_ms), warp_ms, display_ms)
+        perf.maybe_print(getattr(cap, "frames_read", frame_no + 1))
+
         if key == ord('q'):
             break
         elif key == ord('1'):
@@ -1736,7 +2067,8 @@ def run_competition(cfg: dict):
             blind_status_until = time.time() + 2.0
             print("[Blind] 已关闭盲开保护")
         elif key == ord('t'):
-            track_map.clear_history()
+            if track_map is not None:
+                track_map.clear_history()
         elif key == ord('r'):
             # 按 R 键重新校准 H 矩阵
             print("[Recalibrate] 重新检测固定标签...")
@@ -1749,11 +2081,12 @@ def run_competition(cfg: dict):
                 detections = tracker.detect(gray)
                 tracker.compute_homography(detections)
                 fixed_count = sum(1 for d in detections if d["id"] in tracker.tag_positions)
-                display = frame.copy()
-                cv2.putText(display, f"Recalibrating... ({fixed_count}/{len(tracker.tag_positions)})", 
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                cv2.imshow("SeeingTag - Original View", display)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                if display_enabled and show_original_view:
+                    display = frame.copy()
+                    cv2.putText(display, f"Recalibrating... ({fixed_count}/{len(tracker.tag_positions)})",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    cv2.imshow("SeeingTag - Original View", display)
+                if display_enabled and cv2.waitKey(1) & 0xFF == ord('q'):
                     cap.release()
                     tracker.close()
                     tuning_udp.close()
