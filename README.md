@@ -9,13 +9,11 @@
         ↓
 固定 Tag 图像中心  →  场地中心坐标
         ↓
-计算并缓存 Homography / 鸟瞰变换参数
+计算并缓存 Homography（像素 → 场地 X/Z）
         ↓
-采集线程持续读取最新帧，旧帧直接覆盖
-        ↓
-原始画面识别车载 Tag ──失败──→ 低频/按需鸟瞰兜底识别
+原始画面识别车载 Tag ──失败──→ 高分辨率鸟瞰图兜底识别
         ↓                                ↓
-        └────────── 平滑、短暂丢失保持 / 盲开保护 ───┘
+        └────────── 平滑、短暂丢失保持 ───┘
                          ↓
                     UDP → Unity
 ```
@@ -23,14 +21,12 @@
 ## v2 核心改进
 
 - **固定 Tag 中心点建模**：只使用四个固定 Tag 的中心点计算 H；固定码可按现场识别效果横放、竖放或旋转，不需要统一朝向。
-- **多线程最新帧采集**：后台线程持续读取摄像头，只保留最新帧，处理不过来时丢旧帧，避免 UDP 位置逐渐落后真实画面。
-- **原图优先 + 按需鸟瞰兜底**：主链路直接在原图识别车载 Tag，并用缓存 H 映射坐标；原图失败时才生成低分辨率鸟瞰图兜底。
-- **显示与发送解耦**：UDP 发送优先，HUD、鸟瞰窗口和赛道图按 `display_fps` 低频刷新，避免窗口显示拖慢定位发送。
-- **性能统计**：每秒输出 `camera/process/send fps`、`detect/warp/display` 耗时和 `frame_p95`，用于判断是否接近摄像头物理帧率。
+- **旋转角度掉点修复**：Tag 尺寸筛选改用四条图像边的像素长度中位数，不再把顶边的水平投影误当成边长；车载 Tag 转到边缘接近竖直的角度时不会被错误过滤。
+- **原图优先 + 鸟瞰图兜底**：原图丢失车载 Tag 时，自动在 `1600 × 1280` 鸟瞰图中重试。
 - **H 缓存保护**：在 `interval` / `every_frame` 更新失败时保留上一份有效 H，不因固定码短暂离开画面而中断定位。
 - **稳定输出**：视觉层与 UDP 输出层分别平滑；偶发丢帧时保留最近可信位置 `0.35` 秒。
-- **可观测状态**：UDP 附带 `tracking_state`（`raw`、`bird_eye_fallback`、`hold`、`blind`），便于 Unity 做状态提示。
-- **赛道调参窗口**：单独显示 `4m × 5m` 电子赛道图、固定 Tag ID、车辆轨迹、轨迹清除按钮、K/P/D 数值输入、英文备注和保存按钮，方便现场观察定位与控制参数对齐。
+- **可观测状态**：UDP 附带 `tracking_state`（`raw`、`bird_eye_fallback`、`hold`），便于 Unity 做状态提示。
+- **赛道调参窗口**：单独显示 `4m × 5m` 电子赛道图、固定 Tag ID、车辆轨迹、轨迹清除按钮和 K/P/D 保存按钮，方便现场观察定位与控制参数对齐。
 
 ## 快速开始
 
@@ -51,7 +47,7 @@ python main.py --calibrate
 
 ## 场地与标签
 
-默认场地为 `5m × 4m`。固定 Tag（ID 1~4）配置在 `tag_config.json` 的 `tag_world_positions` 中；车载 Tag 默认 ID 为 `10`。
+默认场地为 `5m × 4m`。固定 Tag（ID 1~4）配置在 `tag_config.json` 的 `tag_world_positions` 中；车载 Tag 默认 ID 为 `10`。当前正方形 Tag 的实物边长为 A4 纸短边，即 `0.210m`。
 
 初始化与重新校准时，四个固定 Tag 都必须在画面内，并且平贴在同一场地平面。它们的摆放朝向可以不同，但配置的 `x/z` 必须是各 Tag 的实际中心位置。
 
@@ -63,51 +59,13 @@ python main.py --calibrate
 | `unity_ip` / `unity_port` | Unity UDP 接收地址 |
 | `tuning_udp_enabled` | 是否启用 K/P/D 调参 UDP 发送 |
 | `tuning_ip` / `tuning_port` | K/P/D 调参接收端地址 |
-| `tuning_defaults` | 赛道调参窗口 K/P/D 数值输入默认值 |
+| `tuning_defaults` | 赛道调参窗口 K/P/D 滑条默认值 |
 | `homography_update_mode` | `once`、`interval` 或 `every_frame` |
-| `camera_target_fps` | 打开摄像头时请求的目标 FPS，默认 60 |
-| `camera_thread_enabled` | 是否启用最新帧采集线程 |
-| `display_enabled` / `display_fps` | 是否显示调试窗口，以及窗口刷新频率 |
-| `show_original_view` / `show_bird_eye_view` / `show_track_map` | 分别控制原图、鸟瞰图、赛道图窗口 |
-| `bird_eye_fallback_enabled` | 原图识别失败时是否启用鸟瞰兜底 |
-| `fallback_bird_eye_width` / `fallback_bird_eye_height` | 鸟瞰兜底分辨率 |
-| `perf_stats_enabled` | 是否打印每秒性能统计 |
 | `filter_alpha` | 鸟瞰图和 HUD 的位置/朝向平滑系数 |
 | `output_filter_alpha` | UDP 输出平滑系数 |
 | `flip_x` / `flip_z` | 镜像坐标与朝向，用于校正 Unity 坐标方向 |
 | `car_heading_offset_degrees` | 车头相对车载 Tag 默认方向的角度偏移（度）；会影响鸟瞰箭头和 Unity yaw |
 | `debug_logging` | 输出高频调试日志，比赛时建议关闭 |
-
-## 高速模式与 FPS 验证
-
-默认比赛配置面向低延迟发送：
-
-```json
-{
-  "homography_update_mode": "once",
-  "bird_eye_only": false,
-  "camera_target_fps": 60,
-  "camera_thread_enabled": true,
-  "display_fps": 12,
-  "show_bird_eye_view": false,
-  "bird_eye_fallback_enabled": true,
-  "perf_stats_enabled": true
-}
-```
-
-运行时关注控制台的性能统计：
-
-```text
-[Perf] camera=60.0fps process=58.5fps send=58.5fps detect=...
-```
-
-目标是让 `send_fps` 尽量接近 `camera_fps`。如果摄像头本身不稳定，可以先运行：
-
-```powershell
-python camera_fps_probe.py --backend dshow --fps 30,60 --preview
-```
-
-详细的优化思路见 [定位程序高速化改进方案.md](定位程序高速化改进方案.md)。
 
 ## 赛道调参窗口
 
@@ -115,12 +73,9 @@ python camera_fps_probe.py --backend dshow --fps 30,60 --preview
 
 - 赛道底图来自 `track_map_clean.png`，固定 Tag 会按 `tag_config.json` 标出 ID 1~4。
 - 黄色轨迹线显示车辆历史位置；点 `Clear Trail` 或按 `T` 可以清空轨迹。
-- `K` / `P` / `D` 数值框对应 SmartCar 上位机里的 `pwm_k`、`pid_p`、`pid_d`。
-- 点击数值框后可直接输入，按 `Enter` 确认，`Backspace` 删除，`Esc` 取消。
-- 点击每个数值旁的 `-` / `+` 可以微调；按住 `Shift` 点击会使用 10 倍步长。
-- 点击 `Note` 输入框可以输入英文备注。
+- `LeftIn` 滑条用于微调左侧弯道红色中线显示，解决电子图和实际赛道中线略有偏差的问题。
+- `K` / `P` / `D` 滑条对应 SmartCar 上位机里的 `pwm_k`、`pid_p`、`pid_d`。
 - 点 `Save KPD` 时只发送一次 UDP 包，意图是让接收端保存参数，SmartCar app 下次启动再读取生效；它不是实时调参。
-- 每次保存会追加一条记录到 `调参记录.md`，包含 K/P/D、发送状态和备注。
 
 如果换了赛道底图，可以运行 `track_calibrate.py` 重新点选四个角，生成 `track_calib.json`，让实际 `5m × 4m` 场地坐标映射到图上的正确位置。
 
@@ -152,19 +107,16 @@ python main.py --show-car-heading
 .
 ├── main.py                    # 视觉定位、鸟瞰图、UDP 主程序
 ├── tag_config.json            # 标签布局、场地、网络和滤波配置
-├── camera_fps_probe.py        # 摄像头真实 30/60fps 探测工具
 ├── track_calibrate.py         # 赛道底图四角标定工具
 ├── track_calib.json           # 赛道底图到 5m × 4m 场地坐标的映射
 ├── track_display_tune.json    # 赛道窗口显示微调参数
 ├── track_map_clean.png        # 去除尺寸标注后的赛道底图
 ├── track_map_source.png       # 原始赛道底图
-├── 调参记录.md                # 现场保存 K/P/D 时自动生成/追加
 ├── generate_tag.py            # 生成固定/车载 ArUco Tag
 ├── calibrate_camera.py        # 棋盘格相机标定工具（可选）
 ├── test_*.py                  # 摄像头、IPM、UDP 调试工具
 ├── requirements.txt
 ├── 本次定位优化说明.md         # 完整技术与调参说明
-├── 定位程序高速化改进方案.md   # 60fps / 低延迟链路优化方案
 └── 技术报告_*.md
 ```
 

@@ -1,12 +1,17 @@
 {
-  "tag_size_m": 0.166,
+  "tag_size_m": 0.210,
   "field_width_m": 5.0,
   "field_height_m": 4.0,
   "fov_degrees": 66.1,
   "min_tag_width_pixels": 5,
-  "filter_alpha": 0.45,
-  "output_filter_alpha": 0.25,
+  "filter_alpha": 1.0,
+  "filter_alpha_yaw": 1.0,
+  "output_filter_alpha": 0.9,
+  "output_filter_alpha_yaw": 0.9,
   "debug_logging": false,
+  "camera_index": 1,
+  "headless": true,
+  "blind_keep_armed_default": true,
   "unity_ip": "192.168.43.226",
   "unity_port": 9005,
   "tuning_udp_enabled": true,
@@ -24,7 +29,7 @@
     "4": {"x": 5.0, "y": 0.0, "z": 0.0}
   },
   "car_tag_id": 10,
-  "car_heading_offset_degrees": -136.5,
+  "car_heading_offset_degrees": -135.0,
   "flip_x": false,
   "flip_z": false,
 
@@ -48,8 +53,8 @@
     "blind_trigger_frames": "连续多少帧识别不到才触发盲开，防单帧误丢"
   },
   "motion_history_seconds": 3.0,
-  "blind_drive_seconds": 2.0,
-  "position_hold_seconds": 0.5,
+  "blind_drive_seconds": 2.5,
+  "position_hold_seconds": 0.8,
   "yaw_log_interval_seconds": 0.5,
   "blind_speed_window_seconds": 0.5,
   "blind_yaw_rate_window_seconds": 0.5,
@@ -58,20 +63,9 @@
   "blind_yaw_rate_decay_per_second": 0.75,
   "blind_max_speed_mps": 1.2,
   "blind_max_distance_m": 0.45,
-  "blind_trigger_frames": 5,
+  "blind_trigger_frames": 10,
   "homography_update_mode": "once",
   "homography_update_interval": 30,
 
-  "bird_eye_only": false,
-  "camera_target_fps": 60,
-  "camera_thread_enabled": true,
-  "display_enabled": true,
-  "display_fps": 12,
-  "show_original_view": true,
-  "show_bird_eye_view": false,
-  "show_track_map": true,
-  "bird_eye_fallback_enabled": true,
-  "fallback_bird_eye_width": 800,
-  "fallback_bird_eye_height": 640,
-  "perf_stats_enabled": true
+  "bird_eye_only": true
 }
