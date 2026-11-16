@@ -2,6 +2,8 @@
 
 面向智能车的 ArUco 视觉定位程序：用场地四角固定 Tag 建立平面坐标系，追踪车载 Tag，并通过 UDP 输出位置与朝向给 Unity；同时提供鸟瞰视图、轨迹显示和 K/P/D 调参窗口。
 
+> 📖 完整开发记录（含从 PnP 到单应性映射的架构演变与被记录的误判）：[中文](https://zhangyicong.xyz/zh/projects/seeingtag从pnp到单应性映射/) · [English](https://zhangyicong.xyz/en/projects/seeingtag从pnp到单应性映射/) · [日本語](https://zhangyicong.xyz/ja/projects/seeingtag从pnp到单应性映射/)
+
 ## 特性
 
 - 固定 Tag 按中心点建模，允许不同安装朝向；
@@ -11,6 +13,8 @@
 - 盲开保护受时间、速度和最大距离限制；
 - `Track Map - 4x5` 显示固定 Tag、车辆轨迹并发送一次性 K/P/D 保存包；
 - 支持可缩放原图窗口、校准模式和 headless 运行。
+
+**性能取向**：定位发送频率跟随摄像头帧率（约 15–30Hz）；显示与定位分节奏运行（窗口仅 10–15fps 刷新），处理不及预期时丢弃旧帧而非排队，保证车辆拿到的位置数据尽可能新鲜。详细指标定义与优化路线见仓库内 [定位程序高速化改进方案.md](定位程序高速化改进方案.md) 与 [技术报告](技术报告_SeeingTag_ARUCO定位系统_v2.md)。
 
 ## 安装与运行
 
